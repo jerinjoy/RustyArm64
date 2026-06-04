@@ -198,12 +198,17 @@ class DebuggerOutput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
+def _log_model(node_name: str) -> None:
+    """Print which service/model a node is about to call."""
+    if _model_config is None:
+        return
+    print(f"[{node_name}]  service={_model_config.service}  model={_model_config.resolved_model}")
+
+
 def _get_model():
     """Return a chat model instance from the globally configured ModelConfig."""
     if _model_config is None:
-        raise RuntimeError(
-            "Model not configured. Call configure_model() before running the graph."
-        )
+        raise RuntimeError("Model not configured. Call configure_model() before running the graph.")
     return _model_config.create_chat_model()
 
 
@@ -251,6 +256,7 @@ def architect_node(state: SimulatorState) -> dict:
     successfully-completed steps from the plan, and generates a fresh plan
     when none exists.
     """
+    _log_model("architect")
     result = clear_feedback(state)
     model = _get_structured_model(ArchitectOutput)
 
@@ -301,6 +307,7 @@ Return the COMPLETE remaining plan and the SINGLE next step to execute."""
 
 def spec_reader_node(state: SimulatorState) -> dict:
     """Gather ARM architecture specification context for the current task."""
+    _log_model("spec_reader")
     current_step = state.get("current_step", "")
 
     specs_dir = Path(__file__).resolve().parent.parent / "specs"
@@ -341,6 +348,7 @@ def human_approval_node(state: SimulatorState) -> dict:
 
 def rust_coder_node(state: SimulatorState) -> dict:
     """Generate or update in-memory Rust source files based on spec and feedback."""
+    _log_model("rust_coder")
     current_step = state.get("current_step", "")
     spec_context = state.get("spec_context", "")
     codebase = state.get("codebase", {})
@@ -390,6 +398,7 @@ GUIDELINES
 
 def test_writer_node(state: SimulatorState) -> dict:
     """Add inline Rust unit tests to the codebase for the current task."""
+    _log_model("test_writer")
     current_step = state.get("current_step", "")
     spec_context = state.get("spec_context", "")
     codebase = state.get("codebase", {})
@@ -490,6 +499,7 @@ def cargo_tool_node(state: SimulatorState) -> dict:
 
 def debugger_node(state: SimulatorState) -> dict:
     """Analyse cargo test failures and route repair to code or tests."""
+    _log_model("debugger")
     cargo_output = state.get("cargo_output", "")
     codebase = state.get("codebase", {})
     current_step = state.get("current_step", "")

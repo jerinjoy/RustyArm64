@@ -26,6 +26,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from state import SimulatorState
 from nodes import (
     configure_model,
+    _model_config,
     architect_node,
     spec_reader_node,
     human_approval_node,
@@ -192,7 +193,7 @@ def run(argv: list[str] | None = None):
     configure_model(service=args.service, api_key=args.api_key, model=model_override)
 
     _print_banner()
-    print(f"Service: {args.service}  |  Model: {model_override or '(service default)'}")
+    print(f"Service: {args.service}  |  Model: {_model_config.resolved_model}")
     print()
 
     # ---- SQLite checkpointer ----
