@@ -31,21 +31,32 @@ RustyArm64/
 ```bash
 cd orchestrator
 uv sync
-uv run python main.py -s deepseek -k $DEEPSEEK_API_KEY
+
+# One-time: build the spec indexes (requires ARM64 MRA XML specs)
+ARM64_SPEC_DIR=/path/to/arm64_specs uv run python build_instruction_index.py
+ARM64_SPEC_DIR=/path/to/arm64_specs uv run python build_sysreg_index.py
+
+# Run the orchestrator
+uv run python main.py -s deepseek -k $DEEPSEEK_API_KEY --spec-dir /path/to/arm64_specs
 ```
 
-The orchestrator will generate an implementation plan, show you each step,
-and ask for approval before writing code. Approve with `y`, or type feedback
-to revise.
+The orchestrator will generate an implementation plan, show you each step
+with ARM64 spec context, and ask for plan approval. It then writes code,
+runs tests, and pauses again for test approval. Approve with `y`, or type
+feedback to revise. Approved steps are auto-committed and logged to
+`progress.yaml` — kill and restart on any machine to pick up where you
+left off.
 
 ## How it works
 
-A LangGraph state machine drives a pipeline of LLM and tool nodes through an
-incremental development loop. Each iteration: the architect plans a step, a
-coder writes Rust, a test writer adds tests, a git manager commits, and cargo
-runs the test suite. Failures route through a debugger for automatic repair.
-A topic manager reviews the committed codebase and creates follow-up tasks
-until all planned features are complete.
+A LangGraph pipeline of LLM and tool agents builds the simulator incrementally
+with two human approval gates. Each iteration: architect plans, spec_reader
+loads ARM64 details, you approve the plan, agents write Rust and run tests,
+you approve the results, then progress is committed and logged. Failures
+auto-route through a debugger.
+
+Progress is persisted to `progress.yaml` and `simulator/src/` (both in git)
+so you can kill the orchestrator and resume from any machine.
 
 See [`docs/graph-overview.md`](docs/graph-overview.md) for the full graph
 topology, state shape, routing rules, and LLM configuration.

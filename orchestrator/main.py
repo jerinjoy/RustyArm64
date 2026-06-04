@@ -11,7 +11,7 @@ Service defaults:
     gemini    → gemini-2.5-flash  (requires: uv add langchain-google-genai)
 
 Environment variable fallbacks:
-    LLM_SERVICE, OPENAI_API_KEY, LLM_MODEL
+    LLM_SERVICE, OPENAI_API_KEY, LLM_MODEL, ARM64_SPEC_DIR
 """
 
 import argparse
@@ -26,6 +26,7 @@ from langgraph.checkpoint.sqlite import SqliteSaver
 from state import SimulatorState
 from nodes import (
     configure_model,
+    configure_specs,
     architect_node,
     spec_reader_node,
     human_approval_node,
@@ -33,6 +34,9 @@ from nodes import (
     test_writer_node,
     cargo_tool_node,
     debugger_node,
+    human_test_approval_node,
+    progress_writer_node,
+    committer_node,
 )
 
 import nodes as _nodes
@@ -42,23 +46,33 @@ import nodes as _nodes
 # Conditional routing functions
 # ---------------------------------------------------------------------------
 
-def route_after_human(state: SimulatorState) -> str:
-    """After human_approval: feedback present -> architect, else -> rust_coder."""
+def route_after_plan_approval(state: SimulatorState) -> str:
+    """After human_plan_approval: feedback → architect, else → rust_coder."""
     return "architect" if state.get("human_feedback", "") else "rust_coder"
 
 
 def route_after_cargo(state: SimulatorState) -> str:
-    """cargo success + plan remains -> architect;
-       cargo success + empty plan   -> END;
-       cargo failure                -> debugger."""
+    """cargo success + plan remains → human_test_approval;
+       cargo success + empty plan   → END;
+       cargo failure                → debugger."""
     if state.get("cargo_success", False):
-        return "architect" if state.get("plan", []) else END
+        return "human_test_approval" if state.get("plan", []) else END
     return "debugger"
+
+
+def route_after_test_approval(state: SimulatorState) -> str:
+    """After human_test_approval: feedback → architect, else → progress_writer."""
+    return "architect" if state.get("human_feedback", "") else "progress_writer"
 
 
 def route_after_debugger(state: SimulatorState) -> str:
     """Route to rust_coder or test_writer based on repair_target."""
     return "test_writer" if state.get("repair_target") == "test" else "rust_coder"
+
+
+def route_after_architect(state: SimulatorState) -> str:
+    """Empty plan → END (work complete); otherwise → spec_reader."""
+    return END if not state.get("plan") else "spec_reader"
 
 
 # ---------------------------------------------------------------------------
@@ -70,19 +84,26 @@ def build_graph() -> StateGraph:
 
     builder.add_node("architect", architect_node)
     builder.add_node("spec_reader", spec_reader_node)
-    builder.add_node("human_approval", human_approval_node)
+    builder.add_node("human_plan_approval", human_approval_node)
     builder.add_node("rust_coder", rust_coder_node)
     builder.add_node("test_writer", test_writer_node)
     builder.add_node("cargo_tool", cargo_tool_node)
     builder.add_node("debugger", debugger_node)
+    builder.add_node("human_test_approval", human_test_approval_node)
+    builder.add_node("progress_writer", progress_writer_node)
+    builder.add_node("committer", committer_node)
 
     builder.add_edge(START, "architect")
-    builder.add_edge("architect", "spec_reader")
-    builder.add_edge("spec_reader", "human_approval")
+    builder.add_conditional_edges(
+        "architect",
+        route_after_architect,
+        {"spec_reader": "spec_reader", END: END},
+    )
+    builder.add_edge("spec_reader", "human_plan_approval")
 
     builder.add_conditional_edges(
-        "human_approval",
-        route_after_human,
+        "human_plan_approval",
+        route_after_plan_approval,
         {"architect": "architect", "rust_coder": "rust_coder"},
     )
 
@@ -92,8 +113,17 @@ def build_graph() -> StateGraph:
     builder.add_conditional_edges(
         "cargo_tool",
         route_after_cargo,
-        {"architect": "architect", "debugger": "debugger", END: END},
+        {"human_test_approval": "human_test_approval", "debugger": "debugger", END: END},
     )
+
+    builder.add_conditional_edges(
+        "human_test_approval",
+        route_after_test_approval,
+        {"architect": "architect", "progress_writer": "progress_writer"},
+    )
+
+    builder.add_edge("progress_writer", "committer")
+    builder.add_edge("committer", "architect")
 
     builder.add_conditional_edges(
         "debugger",
@@ -102,6 +132,46 @@ def build_graph() -> StateGraph:
     )
 
     return builder
+
+
+# ---------------------------------------------------------------------------
+# Cold-start: hydrate state from disk (progress.yaml + simulator/src/)
+# ---------------------------------------------------------------------------
+
+def _load_progress_yaml(repo_root: Path) -> dict:
+    """Read progress.yaml and return {completed_steps, pending_plan, current_step}.
+
+    Returns empty dict if the file does not exist.
+    """
+    import yaml
+
+    path = repo_root / "progress.yaml"
+    if not path.exists():
+        return {}
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        return {
+            "completed_steps": data.get("completed_steps", []),
+            "plan": data.get("pending_plan", []),
+            "current_step": data.get("current_step", ""),
+        }
+    except Exception as exc:
+        print(f"[WARN] Could not parse progress.yaml: {exc}", file=sys.stderr)
+        return {}
+
+
+def _scan_codebase(repo_root: Path) -> dict[str, str]:
+    """Read all .rs files under simulator/src/ into a {path: content} dict."""
+    src_dir = repo_root / "simulator" / "src"
+    if not src_dir.is_dir():
+        return {}
+    codebase: dict[str, str] = {}
+    for rs_file in sorted(src_dir.rglob("*.rs")):
+        rel = rs_file.relative_to(src_dir).as_posix()
+        codebase[rel] = rs_file.read_text(encoding="utf-8", errors="replace")
+    if codebase:
+        print(f"[init]  scanned {len(codebase)} Rust source file(s) from {src_dir}")
+    return codebase
 
 
 # ---------------------------------------------------------------------------
@@ -115,10 +185,35 @@ def _print_banner():
     print()
 
 
-def _initial_state() -> dict:
-    return {
+def _initial_state(repo_root: Path, checkpointer: SqliteSaver | None) -> dict:
+    """Return the initial state for a new run.
+
+    If the checkpointer already has saved state (warm resume), return an
+    empty dict so the graph resumes from the last checkpoint.  Otherwise
+    hydrate from progress.yaml and simulator/src/.
+    """
+    if checkpointer is not None:
+        config = {"configurable": {"thread_id": "main"}}
+        try:
+            snapshot = checkpointer.get_tuple(config)
+            if snapshot is not None and snapshot.checkpoint:
+                parent_ns = getattr(snapshot.checkpoint, "parent_ns", None)
+                channel_versions = getattr(snapshot.checkpoint, "channel_versions", {})
+                if parent_ns or channel_versions:
+                    print("[init]  warm resume from existing checkpoint")
+                    return {}
+        except (KeyError, AttributeError, IndexError):
+            pass
+
+    # Cold start — hydrate from disk
+    print("[init]  cold start — hydrating from disk")
+    progress = _load_progress_yaml(repo_root)
+    codebase = _scan_codebase(repo_root)
+
+    state: dict = {
         "plan": [],
         "current_step": "",
+        "completed_steps": [],
         "codebase": {},
         "spec_context": "",
         "cargo_output": "",
@@ -127,16 +222,17 @@ def _initial_state() -> dict:
         "repair_target": "",
         "human_feedback": "",
     }
+    state.update(progress)
+    state["codebase"] = codebase
+
+    if state["completed_steps"]:
+        print(f"[init]  {len(state['completed_steps'])} completed step(s), "
+              f"{len(state['plan'])} pending")
+    return state
 
 
-def _human_input(state_values: dict) -> str | None:
-    """Display current step/spec and collect user decision.
-
-    Returns:
-        "y"     – approved, continue to rust_coder
-        <str>   – rejection feedback, route to architect
-        None    – should not happen (blank input is re-prompted)
-    """
+def _plan_approval_ui(state_values: dict) -> str:
+    """Display current step/spec and collect plan approval decision."""
     plan = state_values.get("plan", [])
     current_step = state_values.get("current_step", "(no step)")
     spec_context = state_values.get("spec_context", "")
@@ -150,7 +246,31 @@ def _human_input(state_values: dict) -> str | None:
     print(f"{'─' * 50}")
 
     while True:
-        raw = input("Approve (y), Reject with feedback (type feedback): ").strip()
+        raw = input("Approve plan (y), Reject with feedback: ").strip()
+        if not raw:
+            continue
+        if raw.lower() in ("y", "yes"):
+            return "y"
+        return raw
+
+
+def _test_approval_ui(state_values: dict) -> str:
+    """Display cargo test results and collect test approval decision."""
+    current_step = state_values.get("current_step", "(no step)")
+    cargo_output = state_values.get("cargo_output", "")
+    plan = state_values.get("plan", [])
+
+    print(f"\n{'─' * 50}")
+    print(f"Step:       {current_step}")
+    print(f"Plan left:  {len(plan)} step(s)")
+    print(f"Cargo:      PASS")
+    if cargo_output:
+        tail = cargo_output[-600:]
+        print(f"Output:     {tail}")
+    print(f"{'─' * 50}")
+
+    while True:
+        raw = input("Approve (y), Reject with feedback: ").strip()
         if not raw:
             continue
         if raw.lower() in ("y", "yes"):
@@ -178,6 +298,12 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=os.environ.get("LLM_MODEL", ""),
         help="Override the default model for the chosen service",
     )
+    p.add_argument(
+        "--spec-dir",
+        default=os.environ.get("ARM64_SPEC_DIR", ""),
+        help="Root path to ARM64 MRA XML specs (contains ISA_A64/ and SysReg/; "
+             "may also be set via ARM64_SPEC_DIR env var)",
+    )
     return p.parse_args(argv)
 
 
@@ -189,9 +315,14 @@ def run(argv: list[str] | None = None):
         sys.exit(1)
 
     model_override = args.model or None
+    repo_root = Path(__file__).resolve().parent.parent
 
     # ---- Configure the LLM ----
     configure_model(service=args.service, api_key=args.api_key, model=model_override)
+
+    # ---- Configure spec file paths ----
+    if args.spec_dir:
+        configure_specs(args.spec_dir)
 
     _print_banner()
     print(f"Service: {args.service}  |  Model: {_nodes._model_config.resolved_model}")
@@ -202,24 +333,33 @@ def run(argv: list[str] | None = None):
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     checkpointer = SqliteSaver(conn)
 
-    # ---- Compile with interrupt_before the human gate ----
+    # ---- Compile with dual interrupts ----
     builder = build_graph()
     graph = builder.compile(
         checkpointer=checkpointer,
-        interrupt_before=["human_approval"],
+        interrupt_before=["human_plan_approval", "human_test_approval"],
     )
 
     config = {"configurable": {"thread_id": "main"}}
-    current_input = _initial_state()
+    current_input = _initial_state(repo_root, checkpointer)
 
     # ---- Event loop ----
     while True:
         interrupted = False
+        interrupt_node: str | None = None
 
         try:
             for event in graph.stream(current_input, config):
                 if "__interrupt__" in event:
                     interrupted = True
+                    # Extract which node was interrupted
+                    for intr in event["__interrupt__"]:
+                        if isinstance(intr, dict):
+                            interrupt_node = intr.get("id", "")
+                        elif hasattr(intr, "id"):
+                            interrupt_node = intr.id
+                        else:
+                            interrupt_node = str(intr)
                     break
 
                 for node_name in event:
@@ -236,29 +376,38 @@ def run(argv: list[str] | None = None):
                         s = graph.get_state(config).values
                         step = s.get("current_step", "")
                         print(f"  → {step}")
+                    elif node_name == "committer":
+                        s = graph.get_state(config).values
+                        step = s.get("current_step", "")
+                        print(f"  → {step}")
                     else:
                         print()
 
         except Exception as exc:
             print(f"\n[ERROR] {exc}", file=sys.stderr)
+            import traceback
+            traceback.print_exc()
             break
 
         if not interrupted:
             final = graph.get_state(config).values
-            ok = final.get("cargo_success", False)
-            print(f"\nDone.  cargo_tool {'passed' if ok else 'failed'}.")
-            print(f"Final plan: {final.get('plan', [])}")
+            completed = final.get("completed_steps", [])
+            plan = final.get("plan", [])
+            print(f"\nDone.  {len(completed)} step(s) completed, "
+                  f"{len(plan)} remaining.")
             break
 
         # ---- Human-in-the-loop ----
         state_vals = graph.get_state(config).values
-        decision = _human_input(state_vals)
+
+        if interrupt_node == "human_test_approval":
+            decision = _test_approval_ui(state_vals)
+        else:
+            decision = _plan_approval_ui(state_vals)
 
         if decision == "y":
-            # Approved – resume normally; human_approval routes to rust_coder
             current_input = None
         else:
-            # Rejected – inject feedback so human_approval routes to architect
             graph.update_state(config, values={"human_feedback": decision})
             current_input = None
 

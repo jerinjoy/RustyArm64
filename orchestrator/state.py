@@ -31,6 +31,7 @@ def clear_feedback(state: dict) -> dict:
 class SimulatorState(TypedDict):
     plan: List[str]
     current_step: str
+    completed_steps: List[str]
     codebase: Annotated[Dict[str, str], _merge_codebase]
     spec_context: str
     cargo_output: str

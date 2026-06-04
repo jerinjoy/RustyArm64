@@ -1,6 +1,10 @@
 .venv/
 __pycache__/
 *.db
+*.db-shm
+*.db-wal
 *.pyc
 .DS_Store
 simulator/target/
+orchestrator/instruction_index.json
+orchestrator/sysreg_index.json
