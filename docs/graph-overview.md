@@ -6,81 +6,76 @@
 START
   │
   ▼
-architect        ◄─────────────────────────────┐
-  │                                              │
-  ▼                                              │
-spec_reader                                       │
-  │                                              │
-  ▼                                              │
-human_approval ───(feedback)─────────────────────┘
+architect ◄──────────────────────────────┐
+  │                                       │
+  ▼                                       │
+spec_reader                               │
+  │                                       │
+  ▼                                       │
+human_approval ───(feedback)──────────────┘
   │
   │ (approved)
   ▼
-rust_coder
+rust_coder ◄────────────────────┐
+  │                              │
+  ▼                              │
+test_writer ◄────────┐           │
+  │                  │           │
+  ▼                  │           │
+cargo_tool            │           │
+  ├─ fail ────────────┤           │
+  │                   ▼           │
+  │              debugger         │
+  │                │  │           │
+  │           (code) (test)       │
+  │              │     └──────────┘
+  │              │          ▲
+  │              └──────────┘
+  │            (both flow back up)
+  ├─ success+empty ─────────► END
   │
-  ▼
-test_writer
-  │
-  ▼
-cargo_tool ───(success + remaining plan)────────► architect
-  │              (success + empty plan)─────────► END
-  │              (failure)──────────────────────► debugger
-  │                                               │
-  │                          ┌──(code bug)────────┘
-  │                          │
-  │                          └──(test bug)───────► test_writer
-  │
-  ▼
- (back to architect or END)
+  └─ success+plan ──────────► architect
 ```
 
-## State (`SimulatorState`, defined in `orchestrator/state.py`)
+## State
+
+State is a shared dictionary that flows through every node. Each node reads from it and returns a partial update — LangGraph merges the updates automatically.
 
 ```
-plan:             List[str]           — remaining implementation steps
-current_step:     str                 — the step currently being worked on
-codebase:         Dict[str, str]      — key=relative path under simulator/src, value=file content
-                                         Uses Annotated[...] reducer to merge partial updates
-spec_context:      str                — ARM64 spec information for the current step
-cargo_output:      str                — stdout+stderr from last cargo test run
-cargo_success:     bool               — whether last cargo test passed
-debugger_feedback: str                — failure analysis from the debugger node
-repair_target:     str                — "code" or "test", set by debugger
-human_feedback:    str                — rejection feedback typed by the human
+plan:             List[str]           remaining implementation steps
+current_step:     str                 the step currently being worked on
+codebase:         Dict[str, str]      key=relative path under simulator/src, value=file content
+                                       Uses an annotated reducer to merge partial updates (nodes
+                                       only return files they touched, not the whole codebase)
+spec_context:     str                 ARM64 spec information for the current step
+cargo_output:     str                 stdout+stderr from last cargo test run
+cargo_success:    bool                whether last cargo test passed
+debugger_feedback: str                failure analysis from the debugger node
+repair_target:    str                 "code" or "test", set by debugger
+human_feedback:   str                 rejection feedback typed by the human
 ```
 
 ## Nodes
 
-| Node | LLM? | Pydantic output | What it does |
-|------|------|-----------------|--------------|
-| `architect` | LLM | `ArchitectOutput(plan, current_step)` | Creates/revises plan, picks next step. Calls `clear_feedback()` at start. |
-| `spec_reader` | LLM | (raw string → `spec_context`) | Gathers ARM64 spec context for the current step. Reads local `specs/`. |
-| `human_approval` | — | (passthrough) | Gated by `interrupt_before`. Routes on `human_feedback`. |
-| `rust_coder` | LLM | `RustCoderOutput(files: dict)` | Generates/updates Rust source. Reads `debugger_feedback` if `repair_target=="code"`. |
-| `test_writer` | LLM | `TestWriterOutput(files: dict)` | Adds `#[cfg(test)]` blocks. Reads `debugger_feedback` if `repair_target=="test"`. |
-| `cargo_tool` | — | — | Writes codebase, validates paths, runs `cargo test`. |
-| `debugger` | LLM | `DebuggerOutput(analysis, repair_target)` | Analyzes failures. Sets `repair_target` to `"code"` or `"test"`. |
-
-## Routing rules
-
-- **`route_after_human`**: `human_feedback` non-empty → architect. Empty → rust_coder.
-- **`route_after_cargo`**: `cargo_success` + plan non-empty → architect. `cargo_success` + plan empty → END. Failure → debugger.
-- **`route_after_debugger`**: `repair_target == "test"` → test_writer. Otherwise → rust_coder.
+| Node | LLM? | Output | What it does |
+|------|------|--------|--------------|
+| `architect` | Yes | plan list + current step | Creates or revises the implementation plan and picks the next step. |
+| `spec_reader` | Yes | ARM64 spec context string | Pulls ARM64 spec details relevant to the current step. |
+| `human_approval` | No | (passthrough) | Pause point for human review; routes on approval or feedback. |
+| `rust_coder` | Yes | file path → content map | Writes or patches Rust implementation files. |
+| `test_writer` | Yes | file path → content map | Adds unit tests. |
+| `cargo_tool` | No | cargo stdout/stderr + pass/fail | Writes files to disk, validates paths, and runs `cargo test`. |
+| `debugger` | Yes | analysis + repair target | Diagnoses test failures and tags the fix target as code or test. |
 
 ## Human-in-the-loop
 
-- Graph compiled with `interrupt_before=["human_approval"]`.
-- At the pause, the CLI calls `graph.get_state(config).values` to show `current_step` and `spec_context`.
-- **Approve** (`y`): resumes with `None` input; human_approval is a passthrough, routes to rust_coder.
-- **Reject** (any other text): calls `graph.update_state(config, values={"human_feedback": text})`, then resumes. Human_approval routes back to architect, which processes the feedback.
+- The graph pauses before `human_approval` and shows the current step with its ARM64 spec context.
+- **Approve** — type `y` to continue to the Rust coder.
+- **Reject** — type any feedback; it's injected into state and the architect revises the plan.
 
-## LLM configuration — per-agent (`orchestrator/nodes.py`)
+## LLM configuration
 
-`configure_model(service, api_key, model=None)` creates one LLM instance per agent
-using the `AGENT_MODEL_DEFAULTS` dict.  Edit that dict to change any agent's model
-or thinking mode.
-
-### Default DeepSeek agent assignments
+Each agent gets its own DeepSeek model and thinking mode, set in the `AGENT_MODEL_DEFAULTS` dict. Edit that dict to swap models or toggle thinking per agent.
 
 | Agent | Model | Thinking |
 |-------|-------|----------|
@@ -90,39 +85,22 @@ or thinking mode.
 | `spec_reader` | `deepseek-v4-flash` | disabled |
 | `test_writer` | `deepseek-v4-flash` | disabled |
 
-### Other services (OpenAI, Gemini)
-
-All agents share the same model (the user-specified or default).  Structured
-output uses `json_schema` (native for OpenAI).
-
-### Structured output per service
-
-- **deepseek** → `json_mode` — uses `response_format` instead of `tool_choice`,
-  works with thinking-enabled models. A `RunnableLambda` prepends `"Output JSON.\n"`
-  to prompts (DeepSeek's `json_object` mode requires the literal word "json").
-- **openai**, **gemini** → `json_schema` (native).
-
 ### Output model validators
 
-`ArchitectOutput` and `DebuggerOutput` have `@model_validator(mode="before")` and
-`@field_validator(mode="before")` to handle LLM field-name variations
-(e.g. `remaining_plan` → `plan`, `first_step` → `current_step`) and type coercions.
+`ArchitectOutput` and `DebuggerOutput` include alias-remapping and type-coercion validators to handle LLM field-name variations (e.g. `remaining_plan` → `plan`, `first_step` → `current_step`).
 
 ## Feedback clearing
 
-`clear_feedback()` resets `human_feedback`, `debugger_feedback`, `repair_target`, and `cargo_output` to empty strings. Called by `architect_node` at the start of every new iteration. Nodes that consume feedback (`rust_coder`, `test_writer`) also clear the fields they read.
+At the start of every new iteration the architect resets `human_feedback`, `debugger_feedback`, `repair_target`, and `cargo_output` so stale data doesn't leak across iterations. Nodes that consume feedback also clear the fields they read.
 
 ## Checkpointer
 
-`SqliteSaver` backed by `orchestrator/checkpoints.db`. Thread ID: `"main"`. Allows pause/resume across process restarts.
+SQLite-backed via `orchestrator/checkpoints.db`, thread ID `"main"`. Lets you pause and resume across process restarts.
 
 ## CLI invocation
 
 ```
 cd orchestrator
 uv run python main.py -s deepseek -k sk-xxx
-uv run python main.py -s openai  -k sk-xxx -m gpt-4.1
 uv run python main.py -s deepseek -k sk-xxx -m deepseek-v4-pro
 ```
-
-Environment variable fallbacks: `LLM_SERVICE`, `OPENAI_API_KEY`, `LLM_MODEL`.

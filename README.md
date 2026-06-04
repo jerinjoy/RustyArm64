@@ -49,9 +49,3 @@ until all planned features are complete.
 
 See [`docs/graph-overview.md`](docs/graph-overview.md) for the full graph
 topology, state shape, routing rules, and LLM configuration.
-
-## LLM configuration
-
-Per-agent model assignment is in [`orchestrator/nodes.py`](orchestrator/nodes.py) at
-the `AGENT_MODEL_DEFAULTS` dict. Edit it to tune model and thinking mode per agent.
-DeepSeek models have been tested.
