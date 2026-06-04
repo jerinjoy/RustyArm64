@@ -2,7 +2,7 @@ import json
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Literal
+from typing import Dict, List, Literal, get_args
 
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -15,6 +15,20 @@ from state import SimulatorState, clear_feedback
 
 # Module-level config set by main.py before the graph runs.
 _model_config: "ModelConfig | None" = None
+
+# Agent-level configs and LLM instances (populated by configure_model).
+_agent_configs: dict[str, ModelConfig] = {}
+_agent_llms: dict[str, object] = {}
+
+# Edit this dict to change DeepSeek model/thinking per agent.
+# Every LLM-backed node reads its own entry by agent name.
+AGENT_MODEL_DEFAULTS: dict[str, dict[str, str]] = {
+    "architect":    {"model": "deepseek-v4-pro",  "thinking": "enabled"},
+    "debugger":     {"model": "deepseek-v4-pro",  "thinking": "enabled"},
+    "rust_coder":   {"model": "deepseek-v4-pro",  "thinking": "disabled"},
+    "spec_reader":  {"model": "deepseek-v4-flash", "thinking": "disabled"},
+    "test_writer":  {"model": "deepseek-v4-flash", "thinking": "disabled"},
+}
 
 SERVICE_DEFAULTS: dict[str, dict[str, str]] = {
     "deepseek": {
@@ -34,16 +48,24 @@ SERVICE_DEFAULTS: dict[str, dict[str, str]] = {
 VALID_SERVICES = frozenset(SERVICE_DEFAULTS.keys())
 
 
+_ThinkingMode = Literal["enabled", "disabled"]
+
+
 @dataclass
 class ModelConfig:
     service: str
     api_key: str
     model: str | None = None
+    thinking: _ThinkingMode = "disabled"
 
     def __post_init__(self):
         if self.service not in VALID_SERVICES:
             raise ValueError(
                 f"Unknown service '{self.service}'. Choose: {', '.join(sorted(VALID_SERVICES))}"
+            )
+        if self.thinking not in get_args(_ThinkingMode):
+            raise ValueError(
+                f"Invalid thinking '{self.thinking}'. Choose: {get_args(_ThinkingMode)}"
             )
 
     @property
@@ -79,13 +101,11 @@ class ModelConfig:
     def _create_deepseek(self):
         from langchain_deepseek import ChatDeepSeek
 
-        # json_mode uses response_format rather than tool_choice, but
-        # thinking-mode models still reject it.  Disable thinking always.
         return ChatDeepSeek(
             model=self.resolved_model,
             api_key=self.api_key,
             temperature=0.2,
-            extra_body={"thinking": {"type": "disabled"}},
+            extra_body={"thinking": {"type": self.thinking}},
         )
 
     def _create_gemini(self):
@@ -102,9 +122,29 @@ class ModelConfig:
 
 
 def configure_model(service: str, api_key: str, model: str | None = None):
-    """Set the global model configuration. Call once before running the graph."""
-    global _model_config
+    """Set up one LLM instance per agent.
+
+    For DeepSeek, reads model/thinking from AGENT_MODEL_DEFAULTS.
+    For other services all agents share the same model.
+    """
+    global _model_config, _agent_configs, _agent_llms
+
     _model_config = ModelConfig(service=service, api_key=api_key, model=model)
+
+    if service == "deepseek":
+        for agent, cfg in AGENT_MODEL_DEFAULTS.items():
+            _agent_configs[agent] = ModelConfig(
+                service="deepseek",
+                api_key=api_key,
+                model=cfg["model"],
+                thinking=cfg.get("thinking", "disabled"),
+            )
+    else:
+        for agent in AGENT_MODEL_DEFAULTS:
+            _agent_configs[agent] = ModelConfig(service=service, api_key=api_key, model=model)
+
+    for agent, cfg in _agent_configs.items():
+        _agent_llms[agent] = cfg.create_chat_model()
 
 
 # ---------------------------------------------------------------------------
@@ -198,28 +238,32 @@ class DebuggerOutput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _log_model(node_name: str) -> None:
-    """Print which service/model a node is about to call."""
-    if _model_config is None:
+def _log_agent(agent_name: str) -> None:
+    """Print which service/model an agent node is about to call."""
+    cfg = _agent_configs.get(agent_name)
+    if cfg is None:
         return
-    print(f"[{node_name}]  service={_model_config.service}  model={_model_config.resolved_model}")
+    print(f"[{agent_name}]  service={cfg.service}  model={cfg.resolved_model}")
 
 
-def _get_model():
-    """Return a chat model instance from the globally configured ModelConfig."""
-    if _model_config is None:
-        raise RuntimeError("Model not configured. Call configure_model() before running the graph.")
-    return _model_config.create_chat_model()
+def _get_agent_model(agent_name: str):
+    """Return the chat model instance for *agent_name*."""
+    if agent_name not in _agent_llms:
+        raise RuntimeError(
+            f"Agent '{agent_name}' not configured. Call configure_model() first."
+        )
+    return _agent_llms[agent_name]
 
 
-def _get_structured_model(output_schema):
-    """Return a model with structured output, using the right method per service.
+def _get_agent_structured_model(agent_name: str, output_schema):
+    """Return a model with structured output for *agent_name*.
 
-    DeepSeek's json_mode requires the word 'json' in the prompt, so we
-    inject a silent prefix.  OpenAI json_schema needs no such workaround.
+    Uses the structured-output method that is compatible with the agent's
+    service (json_mode for DeepSeek, json_schema for others).
     """
-    model = _get_model()
-    method = _model_config.structured_output_method
+    model = _get_agent_model(agent_name)
+    cfg = _agent_configs[agent_name]
+    method = cfg.structured_output_method
     structured = model.with_structured_output(output_schema, method=method)
 
     if method == "json_mode":
@@ -256,9 +300,9 @@ def architect_node(state: SimulatorState) -> dict:
     successfully-completed steps from the plan, and generates a fresh plan
     when none exists.
     """
-    _log_model("architect")
+    _log_agent("architect")
     result = clear_feedback(state)
-    model = _get_structured_model(ArchitectOutput)
+    model = _get_agent_structured_model("architect", ArchitectOutput)
 
     plan = state.get("plan", [])
     current_step = state.get("current_step", "")
@@ -307,7 +351,7 @@ Return the COMPLETE remaining plan and the SINGLE next step to execute."""
 
 def spec_reader_node(state: SimulatorState) -> dict:
     """Gather ARM architecture specification context for the current task."""
-    _log_model("spec_reader")
+    _log_agent("spec_reader")
     current_step = state.get("current_step", "")
 
     specs_dir = Path(__file__).resolve().parent.parent / "specs"
@@ -317,7 +361,7 @@ def spec_reader_node(state: SimulatorState) -> dict:
             if sf.suffix in (".txt", ".md"):
                 spec_text += sf.read_text() + "\n"
 
-    model = _get_model()
+    model = _get_agent_model("spec_reader")
     prompt = f"""You are an ARM64 (AArch64) architecture expert. Given the current
 implementation task, provide the relevant ARM64 specification details.
 
@@ -348,7 +392,7 @@ def human_approval_node(state: SimulatorState) -> dict:
 
 def rust_coder_node(state: SimulatorState) -> dict:
     """Generate or update in-memory Rust source files based on spec and feedback."""
-    _log_model("rust_coder")
+    _log_agent("rust_coder")
     current_step = state.get("current_step", "")
     spec_context = state.get("spec_context", "")
     codebase = state.get("codebase", {})
@@ -356,7 +400,7 @@ def rust_coder_node(state: SimulatorState) -> dict:
     dbg_fb = state.get("debugger_feedback", "")
     repair_target = state.get("repair_target", "")
 
-    model = _get_structured_model(RustCoderOutput)
+    model = _get_agent_structured_model("rust_coder", RustCoderOutput)
 
     debug_section = ""
     if dbg_fb and repair_target == "code":
@@ -398,14 +442,14 @@ GUIDELINES
 
 def test_writer_node(state: SimulatorState) -> dict:
     """Add inline Rust unit tests to the codebase for the current task."""
-    _log_model("test_writer")
+    _log_agent("test_writer")
     current_step = state.get("current_step", "")
     spec_context = state.get("spec_context", "")
     codebase = state.get("codebase", {})
     dbg_fb = state.get("debugger_feedback", "")
     repair_target = state.get("repair_target", "")
 
-    model = _get_structured_model(TestWriterOutput)
+    model = _get_agent_structured_model("test_writer", TestWriterOutput)
 
     debug_section = ""
     if dbg_fb and repair_target == "test":
@@ -499,12 +543,12 @@ def cargo_tool_node(state: SimulatorState) -> dict:
 
 def debugger_node(state: SimulatorState) -> dict:
     """Analyse cargo test failures and route repair to code or tests."""
-    _log_model("debugger")
+    _log_agent("debugger")
     cargo_output = state.get("cargo_output", "")
     codebase = state.get("codebase", {})
     current_step = state.get("current_step", "")
 
-    model = _get_structured_model(DebuggerOutput)
+    model = _get_agent_structured_model("debugger", DebuggerOutput)
 
     code_summary = "\n".join(f"  {p}" for p in sorted(codebase))
 
