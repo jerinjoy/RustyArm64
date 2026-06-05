@@ -47,8 +47,16 @@ import nodes as _nodes
 # ---------------------------------------------------------------------------
 
 def route_after_plan_approval(state: SimulatorState) -> str:
-    """After human_plan_approval: feedback → architect, else → rust_coder."""
-    return "architect" if state.get("human_feedback", "") else "rust_coder"
+    """After human_plan_approval: feedback → architect, note that signals skip → architect,
+    else → rust_coder."""
+    if state.get("human_feedback", ""):
+        return "architect"
+    note = state.get("context_note", "").lower()
+    if note and any(phrase in note for phrase in (
+            "already done", "already exists", "already have", "no need",
+            "skip this", "not needed", "unnecessary")):
+        return "architect"
+    return "rust_coder"
 
 
 def route_after_cargo(state: SimulatorState) -> str:
@@ -185,12 +193,14 @@ def _print_banner():
     print()
 
 
-def _initial_state(repo_root: Path, checkpointer: SqliteSaver | None) -> dict:
+def _initial_state(repo_root: Path, checkpointer: SqliteSaver | None,
+                   startup_directive: str = "") -> dict:
     """Return the initial state for a new run.
 
     If the checkpointer already has saved state (warm resume), return an
     empty dict so the graph resumes from the last checkpoint.  Otherwise
-    hydrate from progress.yaml and simulator/src/.
+    hydrate from progress.yaml and simulator/src/.  *startup_directive* is
+    only applied on cold start.
     """
     if checkpointer is not None:
         config = {"configurable": {"thread_id": "main"}}
@@ -221,6 +231,8 @@ def _initial_state(repo_root: Path, checkpointer: SqliteSaver | None) -> dict:
         "debugger_feedback": "",
         "repair_target": "",
         "human_feedback": "",
+        "context_note": "",
+        "startup_directive": startup_directive,
     }
     state.update(progress)
     state["codebase"] = codebase
@@ -231,31 +243,45 @@ def _initial_state(repo_root: Path, checkpointer: SqliteSaver | None) -> dict:
     return state
 
 
-def _plan_approval_ui(state_values: dict) -> str:
-    """Display current step/spec and collect plan approval decision."""
+def _plan_approval_ui(state_values: dict) -> tuple[str, str]:
+    """Display current step/spec and collect plan approval decision.
+
+    Returns (decision, context_note).
+    decision: "y" = approved, anything else = rejection feedback
+    context_note: extra info passed along when using "y: <message>" syntax
+    """
     plan = state_values.get("plan", [])
     current_step = state_values.get("current_step", "(no step)")
     spec_context = state_values.get("spec_context", "")
+    directive = state_values.get("startup_directive", "")
 
     print(f"\n{'─' * 50}")
     print(f"Step:       {current_step}")
     print(f"Plan left:  {len(plan)} step(s)")
+    if directive:
+        print(f"Directive:  {directive}")
     if spec_context:
         ctx = spec_context[:400].replace("\n", " ")
         print(f"Spec ctx:   {ctx}…")
     print(f"{'─' * 50}")
 
     while True:
-        raw = input("Approve plan (y), Reject with feedback: ").strip()
+        raw = input("y=approve  y:=approve+note  <anything>=reject & revise: ").strip()
         if not raw:
             continue
         if raw.lower() in ("y", "yes"):
-            return "y"
-        return raw
+            return "y", ""
+        if raw.lower().startswith("y:") or raw.lower().startswith("yes:"):
+            note = raw.split(":", 1)[1].strip()
+            return "y", note
+        return raw, ""
 
 
-def _test_approval_ui(state_values: dict) -> str:
-    """Display cargo test results and collect test approval decision."""
+def _test_approval_ui(state_values: dict) -> tuple[str, str]:
+    """Display cargo test results and collect test approval decision.
+
+    Returns (decision, context_note).
+    """
     current_step = state_values.get("current_step", "(no step)")
     cargo_output = state_values.get("cargo_output", "")
     plan = state_values.get("plan", [])
@@ -270,12 +296,15 @@ def _test_approval_ui(state_values: dict) -> str:
     print(f"{'─' * 50}")
 
     while True:
-        raw = input("Approve (y), Reject with feedback: ").strip()
+        raw = input("y=approve  y:=approve+note  <anything>=reject & revise: ").strip()
         if not raw:
             continue
         if raw.lower() in ("y", "yes"):
-            return "y"
-        return raw
+            return "y", ""
+        if raw.lower().startswith("y:") or raw.lower().startswith("yes:"):
+            note = raw.split(":", 1)[1].strip()
+            return "y", note
+        return raw, ""
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -304,6 +333,17 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Root path to ARM64 MRA XML specs (contains ISA_A64/ and SysReg/; "
              "may also be set via ARM64_SPEC_DIR env var)",
     )
+    p.add_argument(
+        "-p", "--prompt",
+        default="",
+        help="Optional startup directive for the architect on cold boot only "
+             "(e.g. 'focus on integer ALU, skip SIMD')",
+    )
+    p.add_argument(
+        "--reset",
+        action="store_true",
+        help="Delete the checkpoint DB before starting (forces a fresh cold start)",
+    )
     return p.parse_args(argv)
 
 
@@ -330,6 +370,12 @@ def run(argv: list[str] | None = None):
 
     # ---- SQLite checkpointer ----
     db_path = Path(__file__).resolve().parent / "checkpoints.db"
+    if args.reset:
+        for suffix in ("", "-shm", "-wal"):
+            p = Path(str(db_path) + suffix)
+            if p.exists():
+                p.unlink()
+        print("[init]  checkpoint DB reset — forcing cold start")
     conn = sqlite3.connect(str(db_path), check_same_thread=False)
     checkpointer = SqliteSaver(conn)
 
@@ -341,7 +387,7 @@ def run(argv: list[str] | None = None):
     )
 
     config = {"configurable": {"thread_id": "main"}}
-    current_input = _initial_state(repo_root, checkpointer)
+    current_input = _initial_state(repo_root, checkpointer, args.prompt)
 
     # ---- Event loop ----
     while True:
@@ -401,11 +447,13 @@ def run(argv: list[str] | None = None):
         state_vals = graph.get_state(config).values
 
         if interrupt_node == "human_test_approval":
-            decision = _test_approval_ui(state_vals)
+            decision, note = _test_approval_ui(state_vals)
         else:
-            decision = _plan_approval_ui(state_vals)
+            decision, note = _plan_approval_ui(state_vals)
 
         if decision == "y":
+            if note:
+                graph.update_state(config, values={"context_note": note})
             current_input = None
         else:
             graph.update_state(config, values={"human_feedback": decision})

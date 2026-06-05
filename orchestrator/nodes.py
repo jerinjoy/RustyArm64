@@ -239,14 +239,46 @@ class ArchitectOutput(BaseModel):
 
 class RustCoderOutput(BaseModel):
     files: Dict[str, str] = Field(
-        description="Map of relative file path -> complete Rust source content"
+        default_factory=dict,
+        description="Map of relative file path -> complete Rust source content",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_raw_map(cls, data: object) -> object:
+        """Handle LLMs that output {path: content} without a 'files' wrapper."""
+        if not isinstance(data, dict):
+            return data
+        if "files" not in data:
+            if any(
+                isinstance(k, str) and isinstance(v, str)
+                and (".rs" in k or "/" in k)
+                for k, v in data.items()
+            ):
+                return {"files": data}
+        return data
 
 
 class TestWriterOutput(BaseModel):
     files: Dict[str, str] = Field(
-        description="Map of relative file path -> complete Rust source (with tests inline)"
+        default_factory=dict,
+        description="Map of relative file path -> complete Rust source (with tests inline)",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _accept_raw_map(cls, data: object) -> object:
+        """Handle LLMs that output {path: content} without a 'files' wrapper."""
+        if not isinstance(data, dict):
+            return data
+        if "files" not in data:
+            if any(
+                isinstance(k, str) and isinstance(v, str)
+                and (".rs" in k or "/" in k)
+                for k, v in data.items()
+            ):
+                return {"files": data}
+        return data
 
 
 class SpecReaderOutput(BaseModel):
@@ -388,6 +420,8 @@ def architect_node(state: SimulatorState) -> dict:
     current_step = state.get("current_step", "")
     completed = state.get("completed_steps", [])
     human_fb = state.get("human_feedback", "")
+    context_note = state.get("context_note", "")
+    startup_directive = state.get("startup_directive", "")
     debugger_fb = state.get("debugger_feedback", "")
     repair_target = state.get("repair_target", "")
     cargo_success = state.get("cargo_success", False)
@@ -403,25 +437,41 @@ def architect_node(state: SimulatorState) -> dict:
 Manage the implementation plan.
 
 CURRENT STATE
-  Remaining plan: {json.dumps(plan)}
-  Current step:   {current_step}
-{completed_summary}  Cargo success:  {cargo_success}
-  Existing files: {json.dumps(codebase_keys) if codebase_keys else "none yet"}
-  Human feedback: {human_fb if human_fb else "none"}
-  Debug feedback: {debugger_fb if debugger_fb else "none"}
-  Repair target:  {repair_target if repair_target else "n/a"}
+  Remaining plan:         {json.dumps(plan)}
+  Current step:           {current_step}
+{completed_summary}  Cargo success:          {cargo_success}
+  Existing files:         {json.dumps(codebase_keys) if codebase_keys else "none yet"}
+  Startup directive:      {startup_directive if startup_directive else "none"}
+  Human feedback:         {human_fb if human_fb else "none"}
+  Context note:           {context_note if context_note else "none"}
+  Debug feedback:         {debugger_fb if debugger_fb else "none"}
+  Repair target:          {repair_target if repair_target else "n/a"}
 
 RULES (apply in order):
-1. If human_feedback is present, use it to revise the plan and current step.
-2. If debugger_feedback is present, adjust the plan to fix the reported issue
-   (keep current_step the same so the fix is applied).
-3. If cargo_success is True and the current step is still in the plan,
+1. If startup_directive is present, use it to guide the plan generation (e.g.
+   scope what to implement, what to skip, coding style, constraints).  The
+   directive applies to ALL steps, not just the first.  Clear it after use.
+2. If human_feedback is present, interpret it literally and revise the plan
+   and current_step.  The feedback is from a human who wants changes.
+   - If feedback says something is already done / in place / exists →
+     REMOVE the current step from the plan and move to the next.
+   - If feedback gives a specific instruction → change the current step to
+     match, or split it into sub-steps.
+   - NEVER return the exact same plan + current_step when human_feedback
+     is present.  If unsure, pick the next step in the plan.
+3. If context_note contains "already done", "already exists", "already have",
+   "no need", "skip this", "not needed", or "unnecessary" → REMOVE the
+   current step from the plan and move to the next.  Otherwise it's just an
+   informational approval note — pass through unchanged.  Clear it after use.
+4. If debugger_feedback is present, adjust the plan to fix the reported
+   issue (keep current_step the same so the fix is applied).
+5. If cargo_success is True and the current step is still in the plan,
    remove it from the plan (it is done). Then pick the next step from the
    remaining plan.
-4. If the plan is empty and no feedback requires action, return an empty plan
-   and empty current_step.
-5. If the plan is empty, generate an initial step-by-step plan for building a
-   minimal but functional ARM64 simulator that can:
+6. If the plan is empty and no feedback requires action, return an empty
+   plan and empty current_step.
+7. If the plan is empty, generate an initial step-by-step plan for building
+   a minimal but functional ARM64 simulator that can:
    - Parse and decode a subset of ARM64 instructions
    - Model CPU registers (X0-X30, SP, PC, NZCV flags)
    - Execute basic data-processing instructions (ADD, SUB, MOV, AND, ORR, EOR…)
@@ -435,6 +485,8 @@ Return the COMPLETE remaining plan and the SINGLE next step to execute."""
     response = model.invoke(prompt)
     result["plan"] = response.plan
     result["current_step"] = response.current_step
+    result["context_note"] = ""
+    result["startup_directive"] = ""
     return result
 
 
@@ -791,6 +843,7 @@ def rust_coder_node(state: SimulatorState) -> dict:
     spec_context = state.get("spec_context", "")
     codebase = state.get("codebase", {})
     human_fb = state.get("human_feedback", "")
+    context_note = state.get("context_note", "")
     dbg_fb = state.get("debugger_feedback", "")
     repair_target = state.get("repair_target", "")
 
@@ -812,8 +865,11 @@ CURRENT TASK
 ARM64 SPEC CONTEXT
   {spec_context[:6000]}
 
-HUMAN FEEDBACK (if any)
+HUMAN FEEDBACK (if any — must address)
   {human_fb if human_fb else "none"}
+
+HUMAN CONTEXT NOTE (informational — approved with this note)
+  {context_note if context_note else "none"}
 {debug_section}
 EXISTING CODEBASE
 {_codebase_to_str(codebase)}
@@ -823,12 +879,14 @@ GUIDELINES
 - Model ARM64 registers in a struct; use enums for instruction types.
 - Keep functions small and testable (pub interfaces, clear ownership).
 - Only return files you are creating or modifying (not the whole codebase).
-- Each file must contain its COMPLETE final content, not a diff."""
+- Each file must contain its COMPLETE final content, not a diff.
+- Return as JSON: {{"files": {{"path.rs": "content", ...}}}} — the "files" key is REQUIRED."""
 
     response = model.invoke(prompt)
     return {
         "codebase": response.files,
         "human_feedback": "",
+        "context_note": "",
         "debugger_feedback": "",
         "repair_target": "",
     }
@@ -872,7 +930,8 @@ REQUIREMENTS
 - Every ARM64 instruction implemented in the current task must have at least
   one test case.
 - If debugger feedback is present, fix the tests based on that feedback.
-- Return only files you modified, with their COMPLETE content including tests."""
+- Return only files you modified, with their COMPLETE content including tests.
+- Return as JSON: {{"files": {{"path.rs": "content", ...}}}} — the "files" key is REQUIRED."""
 
     response = model.invoke(prompt)
     return {

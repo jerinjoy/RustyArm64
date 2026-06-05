@@ -39,3 +39,5 @@ class SimulatorState(TypedDict):
     debugger_feedback: str
     repair_target: str
     human_feedback: str
+    context_note: str
+    startup_directive: str
