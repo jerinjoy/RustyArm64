@@ -16,7 +16,7 @@ SIMULATOR_DIR = "../simulator"
 # ==========================================
 # 1. STATE DEFINITION
 # ==========================================
-class SimulatorState(TypedDict):
+class WorkflowState(TypedDict):
     goal: str
     todo_tasks: List[str]
     completed_tasks: Annotated[List[str], operator.add]
@@ -84,7 +84,7 @@ Your coding standards:
 4. The Rust project is already initialized. When using the `write_rust_file` tool, provide paths relative to the Rust project root (e.g., use `src/cpu.rs`, NOT `simulator/src/cpu.rs`)."""
 
 
-def coder_node(state: SimulatorState):
+def coder_node(state: WorkflowState):
     # Ensure you have export DEEPSEEK_API_KEY="your_key" in your terminal
     api_key = os.getenv("DEEPSEEK_API_KEY")
     if not api_key:
@@ -114,7 +114,7 @@ def coder_node(state: SimulatorState):
     return {"messages": [response]}
 
 
-def tester_node(state: SimulatorState):
+def tester_node(state: WorkflowState):
     """Runs the Rust test suite and captures the output."""
     print(">>> Running cargo test...")
     try:
@@ -154,7 +154,7 @@ def tester_node(state: SimulatorState):
         }
 
 
-def test_evaluator(state: SimulatorState):
+def test_evaluator(state: WorkflowState):
     """Checks the boolean flag to route the graph."""
     if state.get("tests_passed", False):
         return "pass"
@@ -162,7 +162,7 @@ def test_evaluator(state: SimulatorState):
         return "fail"
 
 
-def queue_manager_node(state: SimulatorState):
+def queue_manager_node(state: WorkflowState):
     """Pops the completed task and prepares the state for the next cycle."""
     todo = state.get("todo_tasks", [])
 
@@ -185,7 +185,7 @@ def queue_manager_node(state: SimulatorState):
     }
 
 
-def queue_evaluator(state: SimulatorState):
+def queue_evaluator(state: WorkflowState):
     """Checks if there are tasks remaining in the queue."""
     if len(state.get("todo_tasks", [])) > 0:
         return "continue"
@@ -196,7 +196,7 @@ def queue_evaluator(state: SimulatorState):
 # ==========================================
 # 4. GRAPH CONSTRUCTION
 # ==========================================
-workflow = StateGraph(SimulatorState)
+workflow = StateGraph(WorkflowState)
 
 # Add all nodes
 workflow.add_node("coder", coder_node)
