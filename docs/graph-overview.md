@@ -1,93 +1,93 @@
-# LangGraph Workflow
+# Orchestrator: Graph Overview
 
-The orchestrator (`orchestrator/main.py`) uses LangGraph to coordinate an LLM-driven
-code-and-test loop for building a Rust ARM64 simulator.
+The orchestrator (`orchestrator/main.py`) uses [LangGraph](https://langchain-ai.github.io/langgraph/)
+to drive an LLM through a write → lint → test → advance loop until all tasks are done.
+
+**LangGraph basics:** you define a graph of *nodes* (Python functions) connected by *edges*.
+A shared *state* dict is passed between nodes — each node reads from it and returns a
+partial update. Conditional edges let you branch based on state values.
+
+---
 
 ## State
 
-The graph carries a shared `WorkflowState` dict with these keys:
+All nodes read from and write to a single `WorkflowState` dict:
 
 | Key | Type | Purpose |
 |---|---|---|
-| `goal` | `str` | High-level objective (fixed) |
-| `todo_tasks` | `List[str]` | Queue of tasks the LLM must implement |
-| `completed_tasks` | `List[str]` | Tasks finished so far (reducer: append) |
-| `architecture_spec` | `str` | System prompt describing the target ISA |
-| `compiler_logs` | `str` | Clippy output (stored, not used in routing) |
-| `test_results` | `str` | Latest cargo-test output |
-| `messages` | `List[BaseMessage]` | LLM conversation (reducer: add_messages) |
-| `tests_passed` | `bool` | Whether the last test run passed |
+| `goal` | `str` | High-level objective (never changes) |
+| `todo_tasks` | `List[str]` | Remaining tasks (treated as a queue) |
+| `completed_tasks` | `List[str]` | Finished tasks (append-only) |
+| `architecture_spec` | `str` | ISA description injected into every coder prompt |
+| `test_results` | `str` | Raw output from the last `cargo test` run |
+| `messages` | `List[BaseMessage]` | Conversation history passed to the LLM |
+| `tests_passed` | `bool` | Set by `tester`; cleared by `queue_manager` |
+| `compiler_logs` | `str` | Reserved — currently unused |
+
+---
+
+## Graph
+
+```
+START ──► coder ◄─────────────────────────────────┐
+            │                                      │
+    [tools_condition]                              │
+      ┌─────┴──────┐                               │
+  tool call    text reply                          │
+      │             │                              │
+      ▼             ▼                              │
+   tools         tester                            │
+      │             │                              │
+      └──► coder  [test_evaluator]                 │
+                ┌───┴────┐                         │
+              fail      pass                       │
+                │         │                        │
+              coder   queue_manager                │
+                        │                          │
+                [queue_evaluator]                  │
+                ┌────────┴───────┐                 │
+            continue            done               │
+                │                 │                │
+                └─────────────────┘              END
+```
+
+---
 
 ## Nodes
 
-```
-           ┌──────────┐
-           │  coder   │  LLM writes Rust code (tools: write_rust_file, run_clippy,
-           └────┬─────┘  add_rust_dependency). Decides when a task is complete.
-                │
-        tools_condition
-        ┌───────┴───────┐
-        ▼               ▼
-   ┌─────────┐    ┌─────────┐
-   │  tools  │    │ tester  │  Runs `cargo test`. Sets `tests_passed`.
-   └────┬────┘    └────┬────┘
-        │              │
-        │         test_evaluator
-        │         ┌──────┴──────┐
-        │    "fail"▼        "pass"▼
-        │   ┌─────────┐  ┌──────────────┐
-        └──▶│  coder  │  │ queue_manager│  Pops the current task from
-            └─────────┘  └──────┬───────┘  `todo_tasks`, clears messages.
-                                │
-                          queue_evaluator
-                          ┌───────┴───────┐
-                    "continue"▼       "done"▼
-                     ┌─────────┐        END
-                     │  coder  │
-                     └─────────┘
-```
+**`coder`** — Sends the architecture spec, the current task, and any prior messages
+(tool results, test failures) to DeepSeek Coder. The LLM either calls a tool or
+returns a plain text reply.
 
-### coder
+**`tools`** — LangGraph's built-in `ToolNode`. Executes whichever tool the LLM called
+(`write_rust_file`, `run_clippy`, or `add_rust_dependency`) and appends the result to
+`messages`.
 
-The entry point. Sends the architecture spec and current task to an LLM (DeepSeek Coder).
-Returns an LLM response, which may contain tool calls.
+**`tester`** — Runs `cargo test` and updates `tests_passed` and `test_results`.
 
-### tools
+**`queue_manager`** — Moves the finished task from `todo_tasks` to `completed_tasks`,
+then clears `messages` so the next task starts with a fresh context window.
 
-LangGraph `ToolNode` that executes `write_rust_file`, `run_clippy`, or `add_rust_dependency`.
-Results are appended to `messages` and the graph loops back to `coder`.
+---
 
-### tester
+## Tools available to the LLM
 
-Runs `cargo test` in the simulator directory. Sets `tests_passed` and appends the
-raw test output to both `test_results` and `messages`.
+| Tool | What it does |
+|---|---|
+| `write_rust_file(filepath, content)` | Writes a file inside `../simulator/` |
+| `run_clippy()` | Runs `cargo clippy` and returns warnings/errors |
+| `add_rust_dependency(crate_name)` | Runs `cargo add <crate>` |
 
-### queue_manager
+The coder's system prompt requires it to call `run_clippy` after every file write and fix
+all warnings before declaring a task done.
 
-Called when tests pass. Pops the first task from `todo_tasks`, appends it to
-`completed_tasks`, and clears the `messages` list so the LLM starts fresh on the
-next task.
+---
 
-## Edges
-
-| From | Condition | To | Why |
-|---|---|---|---|
-| `coder` | LLM requested tools | `tools` | Execute file writes / clippy |
-| `coder` | LLM responded with text | `tester` | Task is done — validate with tests |
-| `tools` | (always) | `coder` | Let LLM see tool results |
-| `tester` | `tests_passed == false` | `coder` | Fix failing code |
-| `tester` | `tests_passed == true` | `queue_manager` | Advance to next task |
-| `queue_manager` | tasks remain | `coder` | Implement next task |
-| `queue_manager` | no tasks remain | `END` | Workflow complete |
-
-## Full Loop (one task)
+## One task, end to end
 
 ```
-coder ──tools──▶ coder ──tools──▶ coder ──(no tools)──▶ tester
-                                                           │
-                                              pass ──▶ queue_manager
-                                              fail ──▶ coder (fix)
+coder → (tool call) → tools → coder   # write code, lint, repeat
+coder → (text reply) → tester         # signal "done", run tests
+  tester fail → coder                 # fix the code
+  tester pass → queue_manager         # advance to next task
 ```
-
-The coder–tools loop repeats until the LLM produces a text-only response (no tool calls),
-which signals it believes the current task is complete.
