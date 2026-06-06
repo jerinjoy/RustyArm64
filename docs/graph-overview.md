@@ -1,106 +1,93 @@
-# LangGraph Orchestrator Overview
+# LangGraph Workflow
 
-## Graph topology
-
-```
-START
-  │
-  ▼
-architect ◄──────────────────────────────┐
-  │                                       │
-  ▼                                       │
-spec_reader                               │
-  │                                       │
-  ▼                                       │
-human_approval ───(feedback)──────────────┘
-  │
-  │ (approved)
-  ▼
-rust_coder ◄────────────────────┐
-  │                              │
-  ▼                              │
-test_writer ◄────────┐           │
-  │                  │           │
-  ▼                  │           │
-cargo_tool            │           │
-  ├─ fail ────────────┤           │
-  │                   ▼           │
-  │              debugger         │
-  │                │  │           │
-  │           (code) (test)       │
-  │              │     └──────────┘
-  │              │          ▲
-  │              └──────────┘
-  │            (both flow back up)
-  ├─ success+empty ─────────► END
-  │
-  └─ success+plan ──────────► architect
-```
+The orchestrator (`orchestrator/main.py`) uses LangGraph to coordinate an LLM-driven
+code-and-test loop for building a Rust ARM64 simulator.
 
 ## State
 
-State is a shared dictionary that flows through every node. Each node reads from it and returns a partial update — LangGraph merges the updates automatically.
+The graph carries a shared `WorkflowState` dict with these keys:
 
-```
-plan:             List[str]           remaining implementation steps
-current_step:     str                 the step currently being worked on
-codebase:         Dict[str, str]      key=relative path under simulator/src, value=file content
-                                       Uses an annotated reducer to merge partial updates (nodes
-                                       only return files they touched, not the whole codebase)
-spec_context:     str                 ARM64 spec information for the current step
-cargo_output:     str                 stdout+stderr from last cargo test run
-cargo_success:    bool                whether last cargo test passed
-debugger_feedback: str                failure analysis from the debugger node
-repair_target:    str                 "code" or "test", set by debugger
-human_feedback:   str                 rejection feedback typed by the human
-```
+| Key | Type | Purpose |
+|---|---|---|
+| `goal` | `str` | High-level objective (fixed) |
+| `todo_tasks` | `List[str]` | Queue of tasks the LLM must implement |
+| `completed_tasks` | `List[str]` | Tasks finished so far (reducer: append) |
+| `architecture_spec` | `str` | System prompt describing the target ISA |
+| `compiler_logs` | `str` | Clippy output (stored, not used in routing) |
+| `test_results` | `str` | Latest cargo-test output |
+| `messages` | `List[BaseMessage]` | LLM conversation (reducer: add_messages) |
+| `tests_passed` | `bool` | Whether the last test run passed |
 
 ## Nodes
 
-| Node | LLM? | Output | What it does |
-|------|------|--------|--------------|
-| `architect` | Yes | plan list + current step | Creates or revises the implementation plan and picks the next step. |
-| `spec_reader` | Yes | ARM64 spec context string | Pulls ARM64 spec details relevant to the current step. |
-| `human_approval` | No | (passthrough) | Pause point for human review; routes on approval or feedback. |
-| `rust_coder` | Yes | file path → content map | Writes or patches Rust implementation files. |
-| `test_writer` | Yes | file path → content map | Adds unit tests. |
-| `cargo_tool` | No | cargo stdout/stderr + pass/fail | Writes files to disk, validates paths, and runs `cargo test`. |
-| `debugger` | Yes | analysis + repair target | Diagnoses test failures and tags the fix target as code or test. |
+```
+           ┌──────────┐
+           │  coder   │  LLM writes Rust code (tools: write_rust_file, run_clippy,
+           └────┬─────┘  add_rust_dependency). Decides when a task is complete.
+                │
+        tools_condition
+        ┌───────┴───────┐
+        ▼               ▼
+   ┌─────────┐    ┌─────────┐
+   │  tools  │    │ tester  │  Runs `cargo test`. Sets `tests_passed`.
+   └────┬────┘    └────┬────┘
+        │              │
+        │         test_evaluator
+        │         ┌──────┴──────┐
+        │    "fail"▼        "pass"▼
+        │   ┌─────────┐  ┌──────────────┐
+        └──▶│  coder  │  │ queue_manager│  Pops the current task from
+            └─────────┘  └──────┬───────┘  `todo_tasks`, clears messages.
+                                │
+                          queue_evaluator
+                          ┌───────┴───────┐
+                    "continue"▼       "done"▼
+                     ┌─────────┐        END
+                     │  coder  │
+                     └─────────┘
+```
 
-## Human-in-the-loop
+### coder
 
-- The graph pauses before `human_approval` and shows the current step with its ARM64 spec context.
-- **Approve** — type `y` to continue to the Rust coder.
-- **Reject** — type any feedback; it's injected into state and the architect revises the plan.
+The entry point. Sends the architecture spec and current task to an LLM (DeepSeek Coder).
+Returns an LLM response, which may contain tool calls.
 
-## LLM configuration
+### tools
 
-Each agent gets its own DeepSeek model and thinking mode, set in the `AGENT_MODEL_DEFAULTS` dict. Edit that dict to swap models or toggle thinking per agent.
+LangGraph `ToolNode` that executes `write_rust_file`, `run_clippy`, or `add_rust_dependency`.
+Results are appended to `messages` and the graph loops back to `coder`.
 
-| Agent | Model | Thinking |
-|-------|-------|----------|
-| `architect` | `deepseek-v4-pro` | **enabled** |
-| `debugger` | `deepseek-v4-pro` | **enabled** |
-| `rust_coder` | `deepseek-v4-pro` | **disabled** |
-| `spec_reader` | `deepseek-v4-flash` | disabled |
-| `test_writer` | `deepseek-v4-flash` | disabled |
+### tester
 
-### Output model validators
+Runs `cargo test` in the simulator directory. Sets `tests_passed` and appends the
+raw test output to both `test_results` and `messages`.
 
-`ArchitectOutput` and `DebuggerOutput` include alias-remapping and type-coercion validators to handle LLM field-name variations (e.g. `remaining_plan` → `plan`, `first_step` → `current_step`).
+### queue_manager
 
-## Feedback clearing
+Called when tests pass. Pops the first task from `todo_tasks`, appends it to
+`completed_tasks`, and clears the `messages` list so the LLM starts fresh on the
+next task.
 
-At the start of every new iteration the architect resets `human_feedback`, `debugger_feedback`, `repair_target`, and `cargo_output` so stale data doesn't leak across iterations. Nodes that consume feedback also clear the fields they read.
+## Edges
 
-## Checkpointer
+| From | Condition | To | Why |
+|---|---|---|---|
+| `coder` | LLM requested tools | `tools` | Execute file writes / clippy |
+| `coder` | LLM responded with text | `tester` | Task is done — validate with tests |
+| `tools` | (always) | `coder` | Let LLM see tool results |
+| `tester` | `tests_passed == false` | `coder` | Fix failing code |
+| `tester` | `tests_passed == true` | `queue_manager` | Advance to next task |
+| `queue_manager` | tasks remain | `coder` | Implement next task |
+| `queue_manager` | no tasks remain | `END` | Workflow complete |
 
-SQLite-backed via `orchestrator/checkpoints.db`, thread ID `"main"`. Lets you pause and resume across process restarts.
-
-## CLI invocation
+## Full Loop (one task)
 
 ```
-cd orchestrator
-uv run python main.py -s deepseek -k sk-xxx
-uv run python main.py -s deepseek -k sk-xxx -m deepseek-v4-pro
+coder ──tools──▶ coder ──tools──▶ coder ──(no tools)──▶ tester
+                                                           │
+                                              pass ──▶ queue_manager
+                                              fail ──▶ coder (fix)
 ```
+
+The coder–tools loop repeats until the LLM produces a text-only response (no tool calls),
+which signals it believes the current task is complete.

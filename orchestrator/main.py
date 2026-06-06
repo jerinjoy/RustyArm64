@@ -1,269 +1,273 @@
-"""
-LangGraph orchestrator for incremental ARM64 Rust simulator development.
-
-Run from the orchestrator/ directory:
-    uv run python main.py -s deepseek -k sk-your-key
-    uv run python main.py -s openai -k sk-your-key -m gpt-4.1
-
-Service defaults:
-    deepseek  → deepseek-v4-pro   (https://api.deepseek.com)
-    openai    → gpt-4o            (https://api.openai.com/v1)
-    gemini    → gemini-2.5-flash  (requires: uv add langchain-google-genai)
-
-Environment variable fallbacks:
-    LLM_SERVICE, OPENAI_API_KEY, LLM_MODEL
-"""
-
-import argparse
+import operator
 import os
-import sqlite3
-import sys
-from pathlib import Path
+import subprocess
+from typing import Annotated, List, TypedDict
 
-from langgraph.graph import StateGraph, START, END
-from langgraph.checkpoint.sqlite import SqliteSaver
+from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
+from langchain_core.tools import tool
+from langchain_openai import ChatOpenAI
+from langgraph.graph import END, StateGraph
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
 
-from state import SimulatorState
-from nodes import (
-    configure_model,
-    architect_node,
-    spec_reader_node,
-    human_approval_node,
-    rust_coder_node,
-    test_writer_node,
-    cargo_tool_node,
-    debugger_node,
-)
-
-import nodes as _nodes
+SIMULATOR_DIR = "../simulator"
 
 
-# ---------------------------------------------------------------------------
-# Conditional routing functions
-# ---------------------------------------------------------------------------
-
-def route_after_human(state: SimulatorState) -> str:
-    """After human_approval: feedback present -> architect, else -> rust_coder."""
-    return "architect" if state.get("human_feedback", "") else "rust_coder"
-
-
-def route_after_cargo(state: SimulatorState) -> str:
-    """cargo success + plan remains -> architect;
-       cargo success + empty plan   -> END;
-       cargo failure                -> debugger."""
-    if state.get("cargo_success", False):
-        return "architect" if state.get("plan", []) else END
-    return "debugger"
+# ==========================================
+# 1. STATE DEFINITION
+# ==========================================
+class WorkflowState(TypedDict):
+    goal: str
+    todo_tasks: List[str]
+    completed_tasks: Annotated[List[str], operator.add]
+    architecture_spec: str
+    compiler_logs: str
+    test_results: str
+    messages: Annotated[List[BaseMessage], add_messages]
+    tests_passed: bool
 
 
-def route_after_debugger(state: SimulatorState) -> str:
-    """Route to rust_coder or test_writer based on repair_target."""
-    return "test_writer" if state.get("repair_target") == "test" else "rust_coder"
-
-
-# ---------------------------------------------------------------------------
-# Build the graph
-# ---------------------------------------------------------------------------
-
-def build_graph() -> StateGraph:
-    builder = StateGraph(SimulatorState)
-
-    builder.add_node("architect", architect_node)
-    builder.add_node("spec_reader", spec_reader_node)
-    builder.add_node("human_approval", human_approval_node)
-    builder.add_node("rust_coder", rust_coder_node)
-    builder.add_node("test_writer", test_writer_node)
-    builder.add_node("cargo_tool", cargo_tool_node)
-    builder.add_node("debugger", debugger_node)
-
-    builder.add_edge(START, "architect")
-    builder.add_edge("architect", "spec_reader")
-    builder.add_edge("spec_reader", "human_approval")
-
-    builder.add_conditional_edges(
-        "human_approval",
-        route_after_human,
-        {"architect": "architect", "rust_coder": "rust_coder"},
+# ==========================================
+# 2. TOOLS
+# ==========================================
+@tool
+def write_rust_file(filepath: str, content: str) -> str:
+    """Writes Rust code to the specified file path relative to the Rust project root."""
+    # Ensure we are writing inside the simulator directory
+    full_path = os.path.join(SIMULATOR_DIR, filepath)
+    os.makedirs(
+        os.path.dirname(full_path) if os.path.dirname(full_path) else ".", exist_ok=True
     )
 
-    builder.add_edge("rust_coder", "test_writer")
-    builder.add_edge("test_writer", "cargo_tool")
+    with open(full_path, "w") as f:
+        f.write(content)
+    return f"Successfully wrote to {full_path}"
 
-    builder.add_conditional_edges(
-        "cargo_tool",
-        route_after_cargo,
-        {"architect": "architect", "debugger": "debugger", END: END},
+
+@tool
+def run_clippy() -> str:
+    """Runs `cargo clippy` to lint the current Rust project."""
+    try:
+        # cwd=SIMULATOR_DIR forces the command to run inside the Rust project
+        result = subprocess.run(
+            ["cargo", "clippy", "--message-format=short"],
+            cwd=SIMULATOR_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if result.returncode == 0:
+            return "Clippy passed with no issues."
+        return f"Clippy warnings/errors:\n{result.stderr}\n{result.stdout}"
+    except Exception as e:
+        return f"Failed to run clippy: {e}"
+
+
+@tool
+def add_rust_dependency(crate_name: str) -> str:
+    """Adds a dependency to the Rust project using cargo add."""
+    try:
+        subprocess.run(["cargo", "add", crate_name], cwd=SIMULATOR_DIR, check=True)
+        return f"Successfully added {crate_name}."
+    except Exception as e:
+        return f"Failed to add dependency: {e}"
+
+
+# ==========================================
+# 3. NODES
+# ==========================================
+CODER_PERSONALITY = """You are an expert systems programmer building a Rust-based ARM64 functional simulator.
+Your coding standards:
+1. Always write idiomatic, safe Rust.
+2. Whenever you write or modify a file, you MUST immediately call the `run_clippy` tool.
+3. If `run_clippy` returns warnings, you must fix them before finishing your turn.
+4. The Rust project is already initialized. When using the `write_rust_file` tool, provide paths relative to the Rust project root (e.g., use `src/cpu.rs`, NOT `simulator/src/cpu.rs`)."""
+
+
+def coder_node(state: WorkflowState):
+    # Ensure you have export DEEPSEEK_API_KEY="your_key" in your terminal
+    api_key = os.getenv("DEEPSEEK_API_KEY")
+    if not api_key:
+        raise ValueError("DEEPSEEK_API_KEY environment variable is not set!")
+
+    llm = ChatOpenAI(
+        model="deepseek-coder", api_key=api_key, base_url="https://api.deepseek.com/v1"
     )
 
-    builder.add_conditional_edges(
-        "debugger",
-        route_after_debugger,
-        {"rust_coder": "rust_coder", "test_writer": "test_writer"},
-    )
+    llm_with_tools = llm.bind_tools([write_rust_file, run_clippy, add_rust_dependency])
 
-    return builder
+    current_task = state["todo_tasks"][0] if state["todo_tasks"] else "No tasks left."
+    architecture = state.get("architecture_spec", "No architecture spec provided.")
+
+    messages = [
+        SystemMessage(content=CODER_PERSONALITY),
+        HumanMessage(
+            content=f"Architecture Spec:\n{architecture}\n\nYour Current Task:\n{current_task}"
+        ),
+    ]
+
+    # If there are previous messages (like tool outputs), append them
+    if state.get("messages"):
+        messages.extend(state["messages"])
+
+    response = llm_with_tools.invoke(messages)
+    return {"messages": [response]}
 
 
-# ---------------------------------------------------------------------------
-# Interactive CLI loop
-# ---------------------------------------------------------------------------
+def tester_node(state: WorkflowState):
+    """Runs the Rust test suite and captures the output."""
+    print(">>> Running cargo test...")
+    try:
+        # Run tests in the simulator directory
+        result = subprocess.run(
+            [
+                "cargo",
+                "test",
+                "--color=never",
+            ],  # Disable color codes for cleaner LLM reading
+            cwd=SIMULATOR_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
 
-def _print_banner():
-    print("╔══════════════════════════════════════════════╗")
-    print("║   ARM64 Simulator – LangGraph Orchestrator   ║")
-    print("╚══════════════════════════════════════════════╝")
-    print()
+        # Determine if tests passed based on the return code
+        if result.returncode == 0:
+            output = f"Tests passed successfully.\n{result.stdout}"
+            passed = True
+        else:
+            output = (
+                f"Tests failed.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+            )
+            passed = False
+
+        return {
+            "test_results": output,
+            "messages": [HumanMessage(content=f"System Test Results:\n{output}")],
+            "tests_passed": passed,  # <-- Explicitly set the flag in the state
+        }
+    except Exception as e:
+        error_msg = f"System Error running tests: {e}"
+        return {
+            "test_results": error_msg,
+            "messages": [HumanMessage(content=error_msg)],
+        }
 
 
-def _initial_state() -> dict:
+def test_evaluator(state: WorkflowState):
+    """Checks the boolean flag to route the graph."""
+    if state.get("tests_passed", False):
+        return "pass"
+    else:
+        return "fail"
+
+
+def queue_manager_node(state: WorkflowState):
+    """Pops the completed task and prepares the state for the next cycle."""
+    todo = state.get("todo_tasks", [])
+
+    if not todo:
+        return {}  # Safety catch, shouldn't happen if routing is right
+
+    completed_task = todo[0]
+    remaining_tasks = todo[1:]
+
+    print(f"\n>>> Queue Manager: Finished '{completed_task}'")
+    print(f">>> Tasks remaining: {len(remaining_tasks)}")
+
+    # We clear out the messages array so the LLM starts with a fresh context
+    # for the next task, preventing context window bloat.
     return {
-        "plan": [],
-        "current_step": "",
-        "codebase": {},
-        "spec_context": "",
-        "cargo_output": "",
-        "cargo_success": False,
-        "debugger_feedback": "",
-        "repair_target": "",
-        "human_feedback": "",
+        "todo_tasks": remaining_tasks,
+        "completed_tasks": [completed_task],
+        "tests_passed": False,  # Reset the flag for the next task
+        "messages": [],
     }
 
 
-def _human_input(state_values: dict) -> str | None:
-    """Display current step/spec and collect user decision.
-
-    Returns:
-        "y"     – approved, continue to rust_coder
-        <str>   – rejection feedback, route to architect
-        None    – should not happen (blank input is re-prompted)
-    """
-    plan = state_values.get("plan", [])
-    current_step = state_values.get("current_step", "(no step)")
-    spec_context = state_values.get("spec_context", "")
-
-    print(f"\n{'─' * 50}")
-    print(f"Step:       {current_step}")
-    print(f"Plan left:  {len(plan)} step(s)")
-    if spec_context:
-        ctx = spec_context[:400].replace("\n", " ")
-        print(f"Spec ctx:   {ctx}…")
-    print(f"{'─' * 50}")
-
-    while True:
-        raw = input("Approve (y), Reject with feedback (type feedback): ").strip()
-        if not raw:
-            continue
-        if raw.lower() in ("y", "yes"):
-            return "y"
-        return raw
+def queue_evaluator(state: WorkflowState):
+    """Checks if there are tasks remaining in the queue."""
+    if len(state.get("todo_tasks", [])) > 0:
+        return "continue"
+    else:
+        return "done"
 
 
-def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    p = argparse.ArgumentParser(
-        description="LangGraph orchestrator for ARM64 Rust simulator MVP"
-    )
-    p.add_argument(
-        "-s", "--service",
-        default=os.environ.get("LLM_SERVICE", "deepseek"),
-        choices=["openai", "deepseek", "gemini"],
-        help="LLM service to use (default: deepseek, or $LLM_SERVICE)",
-    )
-    p.add_argument(
-        "-k", "--api-key",
-        default=os.environ.get("OPENAI_API_KEY", ""),
-        help="API key (or set OPENAI_API_KEY env var)",
-    )
-    p.add_argument(
-        "-m", "--model",
-        default=os.environ.get("LLM_MODEL", ""),
-        help="Override the default model for the chosen service",
-    )
-    return p.parse_args(argv)
+# ==========================================
+# 4. GRAPH CONSTRUCTION
+# ==========================================
+workflow = StateGraph(WorkflowState)
 
+# Add all nodes
+workflow.add_node("coder", coder_node)
+workflow.add_node("tools", ToolNode([write_rust_file, run_clippy, add_rust_dependency]))
+workflow.add_node("tester", tester_node)  # <-- New node added
+workflow.add_node("queue_manager", queue_manager_node)
 
-def run(argv: list[str] | None = None):
-    args = _parse_args(argv)
+workflow.set_entry_point("coder")
 
-    if not args.api_key:
-        print("Error: API key required. Use -k or set OPENAI_API_KEY.", file=sys.stderr)
-        sys.exit(1)
+# 1. Coder Routing:
+# If tools are requested, go to 'tools'. If NO tools are requested (text reply), go to 'tester'.
+workflow.add_conditional_edges(
+    "coder",
+    tools_condition,
+    {
+        "tools": "tools",
+        END: "tester",  # <-- Changed from END to "tester"
+    },
+)
 
-    model_override = args.model or None
+# 2. Tools Routing: Always go back to the coder after writing files/running clippy
+workflow.add_edge("tools", "coder")
 
-    # ---- Configure the LLM ----
-    configure_model(service=args.service, api_key=args.api_key, model=model_override)
+# 3. Tester Routing:
+# Evaluate the test results. Fail -> coder. Pass -> END.
+workflow.add_conditional_edges(
+    "tester",
+    test_evaluator,
+    {"fail": "coder", "pass": "queue_manager"},
+)
 
-    _print_banner()
-    print(f"Service: {args.service}  |  Model: {_nodes._model_config.resolved_model}")
-    print()
+# 3. New Queue Routing: Loop back to coder if tasks remain, otherwise END.
+workflow.add_conditional_edges(
+    "queue_manager", queue_evaluator, {"continue": "coder", "done": END}
+)
 
-    # ---- SQLite checkpointer ----
-    db_path = Path(__file__).resolve().parent / "checkpoints.db"
-    conn = sqlite3.connect(str(db_path), check_same_thread=False)
-    checkpointer = SqliteSaver(conn)
+app = workflow.compile()
 
-    # ---- Compile with interrupt_before the human gate ----
-    builder = build_graph()
-    graph = builder.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["human_approval"],
-    )
-
-    config = {"configurable": {"thread_id": "main"}}
-    current_input = _initial_state()
-
-    # ---- Event loop ----
-    while True:
-        interrupted = False
-
-        try:
-            for event in graph.stream(current_input, config):
-                if "__interrupt__" in event:
-                    interrupted = True
-                    break
-
-                for node_name in event:
-                    print(f"[{node_name}] ✓", end="", flush=True)
-
-                    if node_name == "cargo_tool":
-                        s = graph.get_state(config).values
-                        ok = s.get("cargo_success", False)
-                        print(f"  {'PASS' if ok else 'FAIL'}")
-                        if not ok:
-                            tail = s.get("cargo_output", "")[-400:]
-                            print(f"    {tail}")
-                    elif node_name == "architect":
-                        s = graph.get_state(config).values
-                        step = s.get("current_step", "")
-                        print(f"  → {step}")
-                    else:
-                        print()
-
-        except Exception as exc:
-            print(f"\n[ERROR] {exc}", file=sys.stderr)
-            break
-
-        if not interrupted:
-            final = graph.get_state(config).values
-            ok = final.get("cargo_success", False)
-            print(f"\nDone.  cargo_tool {'passed' if ok else 'failed'}.")
-            print(f"Final plan: {final.get('plan', [])}")
-            break
-
-        # ---- Human-in-the-loop ----
-        state_vals = graph.get_state(config).values
-        decision = _human_input(state_vals)
-
-        if decision == "y":
-            # Approved – resume normally; human_approval routes to rust_coder
-            current_input = None
-        else:
-            # Rejected – inject feedback so human_approval routes to architect
-            graph.update_state(config, values={"human_feedback": decision})
-            current_input = None
-
-    conn.close()
-
-
+# ==========================================
+# 5. EXECUTION
+# ==========================================
 if __name__ == "__main__":
-    run(sys.argv[1:])
+    initial_state = {
+        "goal": "Build an ARM64 functional simulator in Rust",
+        "todo_tasks": [
+            (
+                "Implement a Memory struct as a linear byte array [u8; 65536]. "
+                "Add a `fetch` method to the Cpu that reads 4 bytes from Memory at the current PC. "
+                "If the PC points to invalid memory, return a custom 'InvalidPC' error."
+            ),
+            (
+                "Implement an ELF loader using the `goblin` crate. "
+                "The loader must parse the binary, identify the entry point, "
+                "load segments into the Memory struct, and set the CPU's PC to the entry point. "
+                "Return a custom 'ElfLoadError' if the binary is malformed or invalid."
+            ),
+        ],
+        "completed_tasks": [
+            "Create the Cpu struct in src/cpu.rs with 32 general purpose registers."
+        ],
+        "architecture_spec": "Standard ARMv8 architecture.",
+        "compiler_logs": "",
+        "test_results": "",
+        "messages": [],
+        "tests_passed": False,
+    }
+
+    print("Starting LangGraph execution...")
+    # stream() lets you see the outputs as they happen, node by node
+    for event in app.stream(initial_state):
+        for node_name, node_state in event.items():
+            print(f"\n--- Output from {node_name} ---")
+            if "messages" in node_state and node_state["messages"]:
+                print(node_state["messages"][-1].content)
