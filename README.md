@@ -20,3 +20,9 @@ See [`docs/graph-overview.md`](docs/graph-overview.md) for the graph architectur
 export DEEPSEEK_API_KEY="your_key"
 cd orchestrator && uv run main.py
 ```
+
+## Dependencies
+
+### Install the claude MCP skill for LangGraph docs
+
+https://docs.langchain.com/use-these-docs
