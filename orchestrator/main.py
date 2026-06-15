@@ -353,8 +353,25 @@ def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
         llm_with_tools = coder["llm"].bind_tools(
             [read_rust_file, write_rust_file, run_clippy, add_rust_dependency]
         )
-        history = state.get("messages") or []
+        history = list(state.get("messages") or [])
         system = SystemMessage(content=_build_system_prompt(state, coder["base_system_prompt"]))
+
+        # When the agent has used up its tool budget, inject a user turn so it
+        # wraps up without making further tool calls.  Do this BEFORE invoking
+        # the LLM so the LLM sees the instruction rather than having its pending
+        # tool calls silently dropped (which corrupts the message history).
+        at_limit = state.get("tool_call_count", 0) >= coder["max_tool_calls"]
+        if at_limit and history:
+            history = [
+                *history,
+                HumanMessage(
+                    content=(
+                        "You have reached the tool-call limit for this turn. "
+                        "Do NOT call any more tools. Finalise your implementation "
+                        "using only what you have already written and read."
+                    )
+                ),
+            ]
 
         if not history:
             seed = HumanMessage(content="Begin the current task.")
@@ -371,10 +388,12 @@ def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
         return updates
 
     def coder_router(state: WorkflowState):
-        if state.get("tool_call_count", 0) >= coder["max_tool_calls"]:
-            return "tester"
         last = state["messages"][-1]
-        return "tools" if last.tool_calls else "tester"
+        # Always drain pending tool calls first — skipping them leaves unresolved
+        # tool_call_ids in the history and causes a 400 from the API on the next turn.
+        if last.tool_calls:
+            return "tools"
+        return "tester"
 
     workflow = StateGraph(WorkflowState)
 
