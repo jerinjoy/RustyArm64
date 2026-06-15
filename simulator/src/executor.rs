@@ -5,8 +5,6 @@ use crate::registers::Registers;
 /// Errors that can occur during instruction execution.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ExecError {
-    /// The HLT instruction was executed — the processor should stop.
-    Halt,
     /// A memory access was out of bounds.
     MemoryFault(u64),
 }
@@ -40,8 +38,7 @@ impl Cpu {
 /// * `ins` – the decoded [`Instruction`].
 ///
 /// # Returns
-/// * `Ok(())` on normal completion.
-/// * `Err(ExecError::Halt)` for HLT.
+/// * `Ok(())` on normal completion, including HLT.
 /// * `Err(ExecError::MemoryFault)` for out-of-bounds memory accesses.
 pub fn execute_instruction(cpu: &mut Cpu, ins: Instruction) -> Result<(), ExecError> {
     match ins {
@@ -150,7 +147,7 @@ pub fn execute_instruction(cpu: &mut Cpu, ins: Instruction) -> Result<(), ExecEr
 
         Instruction::Hlt { imm16: _imm16 } => {
             cpu.halted = true;
-            Err(ExecError::Halt)
+            Ok(())
         }
     }
 }
@@ -163,6 +160,20 @@ mod tests {
     /// Helper: create a CPU with 1 KiB of memory.
     fn new_cpu() -> Cpu {
         Cpu::new(Memory::new(1024))
+    }
+
+    // ── HLT ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_hlt_sets_halted_flag() {
+        let mut cpu = new_cpu();
+        assert!(!cpu.halted);
+
+        let ins = Instruction::Hlt { imm16: 0 };
+        let result = execute_instruction(&mut cpu, ins);
+
+        assert_eq!(result, Ok(()));
+        assert!(cpu.halted);
     }
 
     // ── ADD immediate ─────────────────────────────────────────────────
