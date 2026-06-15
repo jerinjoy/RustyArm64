@@ -8,3 +8,5 @@ __pycache__/
 simulator/target/
 orchestrator/instruction_index.json
 orchestrator/sysreg_index.json
+opencode.json
+.claude/
