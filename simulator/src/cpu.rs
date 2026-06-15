@@ -1,4 +1,4 @@
-use crate::decode::{self, Instruction};
+use crate::decode::{self, DecodeError, Instruction};
 
 /// Errors that can occur during CPU execution.
 #[derive(Debug, PartialEq, Eq)]
@@ -112,13 +112,14 @@ impl Cpu {
         inst: Instruction,
     ) -> Result<(), SimError> {
         match inst {
-            Instruction::AddSub {
+            Instruction::AddSubImmediate {
                 sf,
                 op,
-                shift,
-                imm12,
-                rn,
+                s: _s,
                 rd,
+                rn,
+                imm12,
+                shift,
             } => {
                 // Compute the immediate value.
                 let imm: u64 = if shift {
@@ -155,8 +156,16 @@ impl Cpu {
 
                 Ok(())
             }
-            Instruction::Movz { hw, imm16, rd } => {
-                // MOVZ sets rd to (imm16 << hw), zeroing all other bits.
+            Instruction::MovWideImmediate {
+                sf: _sf,
+                opc: _opc,
+                hw,
+                imm16,
+                rd,
+            } => {
+                // MOVZ/MOVK sets rd to (imm16 << hw), zeroing all other bits.
+                // Note: for MOVK, the existing register value is *not* preserved
+                // in this MVP.  Future work will add MOVK semantics.
                 let value = (imm16 as u64) << hw;
                 if rd != 31 {
                     self.write_reg(rd as usize, value);
@@ -165,12 +174,7 @@ impl Cpu {
                 }
                 Ok(())
             }
-            Instruction::Hlt => Err(SimError::Halt),
-            Instruction::Unknown => {
-                // This case is handled by `step` before calling `execute`.
-                // If it is reached, something went wrong.
-                Err(SimError::UnknownInstruction(0))
-            }
+            Instruction::Hlt { imm16: _imm16 } => Err(SimError::Halt),
         }
     }
 
@@ -178,19 +182,20 @@ impl Cpu {
     ///
     /// On success, advances PC by 4.
     /// On `HLT`, returns `Err(SimError::Halt)` without modifying PC.
-    /// On an unknown instruction, returns
+    /// On a decode failure, returns
     /// `Err(SimError::UnknownInstruction)` without modifying PC.
     /// On a memory fault during fetch, returns
     /// `Err(SimError::MemoryFault)` without modifying PC.
     pub fn step(&mut self, mem: &mut [u8]) -> Result<(), SimError> {
         let inst_word = self.fetch(mem)?;
 
-        // Handle unknown instructions before execution so we can
-        // include the raw instruction word in the error.
-        let inst = decode::decode(inst_word);
-        if matches!(inst, Instruction::Unknown) {
-            return Err(SimError::UnknownInstruction(inst_word));
-        }
+        // Decode the instruction word.
+        let inst = match decode::decode(inst_word) {
+            Ok(inst) => inst,
+            Err(DecodeError::UnknownOpcode(_) | DecodeError::IllegalEncoding) => {
+                return Err(SimError::UnknownInstruction(inst_word));
+            }
+        };
 
         match self.execute(mem, inst) {
             Err(SimError::Halt) => Err(SimError::Halt),
@@ -344,10 +349,10 @@ mod tests {
 
     #[test]
     fn test_step_hlt() {
-        // HLT #0  →  0xD4400000
+        // HLT #0  →  0xD4030000
         // Memory must be large enough to cover PC (0x100) + 4.
         let mut mem = vec![0u8; 0x104];
-        write_inst(&mut mem, 0x100, 0xD440_0000);
+        write_inst(&mut mem, 0x100, 0xD403_0000);
 
         let mut cpu = Cpu::new();
         cpu.write_pc(0x100);
@@ -363,12 +368,12 @@ mod tests {
         // Sequence:
         //   0x00: MOVZ X5, #0x42  →  0xD2800845  (write 0x42 into X5)
         //   0x04: ADD X5, X5, #1  →  0x910004A5  (X5 = X5 + 1 → 0x43)
-        //   0x08: HLT #0          →  0xD4400000
+        //   0x08: HLT #0          →  0xD4030000
 
         let mut mem = vec![0u8; 64];
         write_inst(&mut mem, 0x00, 0xD280_0845); // MOVZ X5, #0x42
         write_inst(&mut mem, 0x04, 0x9100_04A5); // ADD X5, X5, #1
-        write_inst(&mut mem, 0x08, 0xD440_0000); // HLT
+        write_inst(&mut mem, 0x08, 0xD403_0000); // HLT
 
         let mut cpu = Cpu::new();
         cpu.write_pc(0x00);
@@ -403,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_step_unknown_instruction() {
-        // 0x00000000 is not a valid decoded instruction → Unknown
+        // 0x00000000 is not a valid decoded instruction → UnknownOpcode
         let mut mem = vec![0u8; 64];
         write_inst(&mut mem, 0, 0x0000_0000);
 
@@ -454,7 +459,7 @@ mod tests {
     #[test]
     fn test_execute_movz_rd_31_writes_sp() {
         // MOVZ SP, #0x42  →  rd=31, hw=0, imm16=0x42
-        // Encoding: sf=1 | 10 | 100101 | hw=00 | imm16=0x42 | rd=11111
+        // Encoding: sf=1 | opc=10 | 100101 | hw=00 | imm16=0x42 | rd=11111
         // = 0xD280085F
         let mut mem = vec![0u8; 64];
         write_inst(&mut mem, 0, 0xD280_085F);
