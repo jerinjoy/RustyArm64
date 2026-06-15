@@ -176,7 +176,7 @@ def plan_evaluator(state: WorkflowState):
 
 
 def tester_node(state: WorkflowState):
-    print(">>> Running cargo test...")
+    print("\n>>> [tester] running cargo test...")
     try:
         result = subprocess.run(
             ["cargo", "test", "--color=never"],
@@ -213,6 +213,7 @@ def test_evaluator(state: WorkflowState):
 
 
 def queue_manager_node(state: WorkflowState):
+    print("\n>>> [queue_manager] starting...")
     todo = state.get("todo_tasks", [])
     if not todo:
         return {}
@@ -261,6 +262,7 @@ def queue_evaluator(state: WorkflowState):
 
 
 def give_up_node(state: WorkflowState):
+    print("\n>>> [give_up] starting...")
     task = state["todo_tasks"][0] if state["todo_tasks"] else "unknown"
     step_yaml = state.get("step_plans", {}).get(task, "No step plan found.")
     print(f"\n>>> GIVING UP on '{task}' after {state.get('retry_count', 0)} failed attempts.")
@@ -285,6 +287,7 @@ def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
     coder = resolve_node("coder", cfg, llm_pool)
 
     def planner_node(state: WorkflowState):
+        print("\n>>> [planner] starting...")
         plan_draft = state.get("plan_draft")
         plan_feedback = state.get("plan_feedback")
 
@@ -339,6 +342,8 @@ def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
             }
 
     def coder_node(state: WorkflowState):
+        task = state["todo_tasks"][0] if state.get("todo_tasks") else "unknown"
+        print(f"\n>>> [coder] working on: {task}")
         llm_with_tools = coder["llm"].bind_tools(
             [read_rust_file, write_rust_file, run_clippy, add_rust_dependency]
         )
@@ -455,21 +460,37 @@ if __name__ == "__main__":
         while True:
             interrupted = False
             interrupt_payload = None
+            content_streamed = False
+            seen_tool_ids: set[str] = set()
 
-            for chunk in app.stream(stream_input, lg_config, stream_mode="updates"):
-                if "__interrupt__" in chunk:
-                    interrupted = True
-                    interrupt_payload = chunk["__interrupt__"][0].value
-                else:
-                    for node_name, node_state in chunk.items():
-                        print(f"\n--- Output from {node_name} ---")
-                        if "messages" in node_state and node_state["messages"]:
-                            print(node_state["messages"][-1].content)
+            for mode, data in app.stream(stream_input, lg_config, stream_mode=["updates", "messages"]):
+                if mode == "messages":
+                    msg_chunk, _metadata = data
+                    # Stream LLM content tokens as they arrive
+                    content = msg_chunk.content
+                    if isinstance(content, str) and content:
+                        print(content, end="", flush=True)
+                        content_streamed = True
+                    # Announce tool calls by name only — suppress argument JSON
+                    for tc in getattr(msg_chunk, "tool_call_chunks", []):
+                        tc_id = tc.get("id") if isinstance(tc, dict) else getattr(tc, "id", None)
+                        name = tc.get("name") if isinstance(tc, dict) else getattr(tc, "name", None)
+                        if tc_id and name and tc_id not in seen_tool_ids:
+                            print(f"\n>>> [tool] {name}(...)", flush=True)
+                            seen_tool_ids.add(tc_id)
+                elif mode == "updates":
+                    if "__interrupt__" in data:
+                        interrupted = True
+                        interrupt_payload = data["__interrupt__"][0].value
+                    elif data:
+                        print()  # newline after inline-streamed content
 
             if not interrupted:
                 break
 
-            print(interrupt_payload)
+            # If resuming from a checkpoint the plan wasn't re-streamed — show it
+            if not content_streamed and interrupt_payload:
+                print(interrupt_payload)
             while True:
                 user_response = input("\nApprove plan? [yes] or type feedback to revise: ").strip()
                 if user_response:
