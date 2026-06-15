@@ -113,14 +113,38 @@ pub fn execute_instruction(cpu: &mut Cpu, ins: Instruction) -> Result<(), ExecEr
         }
 
         Instruction::MovWideImmediate {
-            sf: _sf,
-            opc: _opc,
+            sf,
+            opc,
             hw,
             imm16,
             rd,
         } => {
-            let value = (imm16 as u64) << hw;
+            // ── Build the value according to opc ─────────────────────
+            let value = match opc {
+                0b10 => {
+                    // MOVZ: clear all bits, then insert imm16 at hw.
+                    (imm16 as u64) << hw
+                }
+                0b11 => {
+                    // MOVK: keep existing register value, insert
+                    // imm16 into the 16-bit field at position hw.
+                    let existing = cpu.regs.read(rd);
+                    let mask = !(0xFFFFu64 << hw);
+                    (existing & mask) | ((imm16 as u64) << hw)
+                }
+                _ => {
+                    // MOVN (opc == 0b00) and reserved encodings are
+                    // not implemented in this MVP; treat as no-op.
+                    return Ok(());
+                }
+            };
+
+            // ── 32-bit operation: zero-extend ────────────────────────
+            let value = if sf { value } else { value & 0xFFFF_FFFF };
+
+            // ── Write destination (rd=31 → zero register, discarded) ─
             cpu.regs.write(rd, value);
+
             Ok(())
         }
 
@@ -487,5 +511,99 @@ mod tests {
 
         execute_instruction(&mut cpu, ins).expect("should succeed");
         assert_eq!(cpu.regs.read(10), 0x1000);
+    }
+
+    // ── MOV wide immediate ───────────────────────────────────────────
+
+    #[test]
+    fn test_movz_64_shift0() {
+        // MOVZ X3, #0xBEEF, LSL #0  → opc=2, hw=0, imm16=0xBEEF, rd=3
+        let mut cpu = new_cpu();
+
+        let ins = Instruction::MovWideImmediate {
+            sf: true,
+            opc: 2,
+            hw: 0,
+            imm16: 0xBEEF,
+            rd: 3,
+        };
+
+        execute_instruction(&mut cpu, ins).expect("should succeed");
+        assert_eq!(cpu.regs.read(3), 0xBEEF);
+    }
+
+    #[test]
+    fn test_movz_64_shift48() {
+        // MOVZ X7, #0xABCD, LSL #48  → opc=2, hw=48, imm16=0xABCD, rd=7
+        let mut cpu = new_cpu();
+
+        let ins = Instruction::MovWideImmediate {
+            sf: true,
+            opc: 2,
+            hw: 48,
+            imm16: 0xABCD,
+            rd: 7,
+        };
+
+        execute_instruction(&mut cpu, ins).expect("should succeed");
+        assert_eq!(cpu.regs.read(7), 0xABCD_0000_0000_0000);
+    }
+
+    #[test]
+    fn test_movk_preserve_other_bits() {
+        // Set up X5 with a known pattern, then MOVK into bits [47:32].
+        let mut cpu = new_cpu();
+        cpu.regs.write(5, 0xDEAD_0000_BEEF_CAFE);
+
+        // MOVK X5, #0x1234, LSL #32  → opc=3, hw=32, imm16=0x1234, rd=5
+        let ins = Instruction::MovWideImmediate {
+            sf: true,
+            opc: 3,
+            hw: 32,
+            imm16: 0x1234,
+            rd: 5,
+        };
+
+        execute_instruction(&mut cpu, ins).expect("should succeed");
+        // Bits [47:32] become 0x1234; all other 16-bit fields stay intact.
+        assert_eq!(cpu.regs.read(5), 0xDEAD_1234_BEEF_CAFE);
+    }
+
+    #[test]
+    fn test_movz_32_zero_extend() {
+        // MOVZ W2, #0xFFFF, LSL #16  → sf=0, opc=2, hw=16, imm16=0xFFFF, rd=2
+        // 32-bit operation must zero the upper 32 bits of the register.
+        let mut cpu = new_cpu();
+        cpu.regs.write(2, 0xAAAA_BBBB_CCCC_DDDD); // pre-fill with junk
+
+        let ins = Instruction::MovWideImmediate {
+            sf: false,
+            opc: 2,
+            hw: 16,
+            imm16: 0xFFFF,
+            rd: 2,
+        };
+
+        execute_instruction(&mut cpu, ins).expect("should succeed");
+        // Result: [31:16] = 0xFFFF, [15:0] = 0x0000, upper 32 bits = 0.
+        assert_eq!(cpu.regs.read(2), 0xFFFF_0000);
+    }
+
+    #[test]
+    fn test_mov_wide_discard_when_rd_31() {
+        // MOVZ XZR, #0x42, LSL #0 → rd=31, write is discarded.
+        let mut cpu = new_cpu();
+
+        let ins = Instruction::MovWideImmediate {
+            sf: true,
+            opc: 2,
+            hw: 0,
+            imm16: 0x42,
+            rd: 31,
+        };
+
+        execute_instruction(&mut cpu, ins).expect("should succeed");
+        // XZR always reads back as 0.
+        assert_eq!(cpu.regs.read(31), 0);
     }
 }
