@@ -1,21 +1,24 @@
 import operator
 import os
 import subprocess
-from typing import Annotated, List, TypedDict
+import yaml
+from typing import Annotated, Dict, List, Optional, TypedDict
 
 from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage, SystemMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
-from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
+from langgraph.types import Command, interrupt
 
 SIMULATOR_DIR = "../simulator"
-MAX_RETRIES = 5
+MAX_TEST_RETRIES = 5
+MAX_TOOL_CALLS = 20
 
 _llm = ChatOpenAI(
-    model="deepseek-coder",
+    model="deepseek-v4-pro",
     api_key=os.getenv("DEEPSEEK_API_KEY"),
     base_url="https://api.deepseek.com/v1",
 )
@@ -26,18 +29,31 @@ _llm = ChatOpenAI(
 # ==========================================
 class WorkflowState(TypedDict):
     goal: str
+    plan_draft: Optional[str]
+    plan_approved: bool
+    plan_feedback: Optional[str]
     todo_tasks: List[str]
     completed_tasks: Annotated[List[str], operator.add]
+    step_plans: Dict[str, str]
     architecture_spec: str
     test_results: str
     messages: Annotated[List[BaseMessage], add_messages]
     tests_passed: bool
     retry_count: int
+    tool_call_count: int
 
 
 # ==========================================
 # 2. TOOLS
 # ==========================================
+@tool
+def read_rust_file(filepath: str) -> str:
+    """Reads and returns the contents of a file relative to the Rust project root."""
+    full_path = os.path.join(SIMULATOR_DIR, filepath)
+    with open(full_path, "r") as f:
+        return f.read()
+
+
 @tool
 def write_rust_file(filepath: str, content: str) -> str:
     """Writes Rust code to the specified file path relative to the Rust project root."""
@@ -83,17 +99,22 @@ def add_rust_dependency(crate_name: str) -> str:
 # ==========================================
 def _build_system_prompt(state: WorkflowState) -> str:
     architecture = state.get("architecture_spec", "No architecture spec provided.")
-    current_task = state["todo_tasks"][0] if state["todo_tasks"] else "No tasks left."
+    current_step_id = state["todo_tasks"][0] if state["todo_tasks"] else None
+    if current_step_id:
+        step_yaml = state.get("step_plans", {}).get(current_step_id, "No step plan found.")
+    else:
+        step_yaml = "No tasks left."
     prompt = (
         "You are an expert systems programmer building a Rust-based ARM64 functional simulator.\n"
         "Your coding standards:\n"
         "1. Always write idiomatic, safe Rust.\n"
-        "2. Whenever you write or modify a file, you MUST immediately call the `run_clippy` tool.\n"
-        "3. If `run_clippy` returns warnings, you must fix them before finishing your turn.\n"
-        "4. The Rust project is already initialized. When using the `write_rust_file` tool, "
+        "2. Before modifying an existing file, call `read_rust_file` first — never reconstruct a file from memory.\n"
+        "3. Whenever you write or modify a file, you MUST immediately call the `run_clippy` tool.\n"
+        "4. If `run_clippy` returns warnings, you must fix them before finishing your turn.\n"
+        "5. The Rust project is already initialized. When using the `write_rust_file` tool, "
         "provide paths relative to the Rust project root (e.g., use `src/cpu.rs`, NOT `simulator/src/cpu.rs`).\n\n"
         f"Architecture Spec:\n{architecture}\n\n"
-        f"Current Task:\n{current_task}"
+        f"Current Step Plan:\n{step_yaml}"
     )
     test_results = state.get("test_results", "")
     if test_results and not state.get("tests_passed", False):
@@ -101,18 +122,87 @@ def _build_system_prompt(state: WorkflowState) -> str:
     return prompt
 
 
+def planner_node(state: WorkflowState):
+    plan_draft = state.get("plan_draft")
+    plan_feedback = state.get("plan_feedback")
+
+    messages = [
+        SystemMessage(content=(
+            "You are a senior software architect planning the implementation of an ARM64 functional simulator in Rust.\n"
+            "Produce a structured multi-step plan. For each step output a YAML document following this schema:\n"
+            "id, title, depends_on, deliverables (files, types, functions), interface_contracts, "
+            "cargo_dependencies, tests, acceptance_criteria.\n"
+            "Separate multiple steps with '---'."
+        )),
+        HumanMessage(content=(
+            f"Goal: {state['goal']}\n\n"
+            f"Architecture Spec:\n{state.get('architecture_spec', '')}\n\n"
+            + (f"Previous plan draft:\n{plan_draft}\n\n" if plan_draft else "")
+            + (
+                f"Human feedback:\n{plan_feedback}\n\nRevise the plan accordingly."
+                if plan_feedback
+                else "Produce the initial plan draft."
+            )
+        )),
+    ]
+
+    response = _llm.invoke(messages)
+    revised_draft = response.content
+
+    user_response = interrupt(revised_draft)
+
+    if user_response.strip().lower() == "approved":
+        step_plans = {}
+        todo_tasks = []
+        for doc in revised_draft.split("---"):
+            doc = doc.strip()
+            if not doc:
+                continue
+            try:
+                parsed = yaml.safe_load(doc)
+                if parsed and isinstance(parsed, dict) and "id" in parsed:
+                    step_id = parsed["id"]
+                    step_plans[step_id] = doc
+                    todo_tasks.append(step_id)
+            except Exception:
+                pass
+        return {
+            "plan_draft": None,
+            "plan_approved": True,
+            "plan_feedback": None,
+            "todo_tasks": todo_tasks,
+            "step_plans": step_plans,
+            "retry_count": 0,
+            "tool_call_count": 0,
+        }
+    else:
+        return {
+            "plan_draft": revised_draft,
+            "plan_feedback": user_response,
+        }
+
+
+def plan_evaluator(state: WorkflowState):
+    return "coder" if state.get("plan_approved", False) else "planner"
+
+
 def coder_node(state: WorkflowState):
-    llm_with_tools = _llm.bind_tools([write_rust_file, run_clippy, add_rust_dependency])
+    llm_with_tools = _llm.bind_tools([read_rust_file, write_rust_file, run_clippy, add_rust_dependency])
     history = state.get("messages") or []
 
-    # On a fresh task the history is empty — seed it with the task prompt so it's
-    # tracked in state and visible in checkpoints / LangSmith traces.
     if not history:
         seed = HumanMessage(content="Begin the current task.")
-        return {"messages": [seed, llm_with_tools.invoke([SystemMessage(content=_build_system_prompt(state)), seed])]}
+        response = llm_with_tools.invoke([SystemMessage(content=_build_system_prompt(state)), seed])
+        updates = {"messages": [seed, response]}
+        if response.tool_calls:
+            updates["tool_call_count"] = state.get("tool_call_count", 0) + 1
+        return updates
 
     response = llm_with_tools.invoke([SystemMessage(content=_build_system_prompt(state)), *history])
-    return {"messages": [response]}
+    updates = {"messages": [response]}
+    if response.tool_calls:
+        updates["tool_call_count"] = state.get("tool_call_count", 0) + 1
+    return updates
 
 
 def tester_node(state: WorkflowState):
@@ -147,7 +237,7 @@ def tester_node(state: WorkflowState):
 def test_evaluator(state: WorkflowState):
     if state.get("tests_passed", False):
         return "pass"
-    if state.get("retry_count", 0) >= MAX_RETRIES:
+    if state.get("retry_count", 0) >= MAX_TEST_RETRIES:
         return "give_up"
     return "fail"
 
@@ -163,11 +253,35 @@ def queue_manager_node(state: WorkflowState):
     print(f"\n>>> Queue Manager: Finished '{completed_task}'")
     print(f">>> Tasks remaining: {len(remaining_tasks)}")
 
+    git_status = subprocess.run(
+        ["git", "status", "--porcelain"],
+        cwd=SIMULATOR_DIR,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if git_status.stdout.strip():
+        step_yaml = state.get("step_plans", {}).get(completed_task, "")
+        title = completed_task
+        try:
+            parsed = yaml.safe_load(step_yaml)
+            if parsed and isinstance(parsed, dict):
+                title = parsed.get("title", completed_task)
+        except Exception:
+            pass
+        subprocess.run(["git", "add", "-A"], cwd=SIMULATOR_DIR, check=False)
+        subprocess.run(
+            ["git", "commit", "-m", f"complete {completed_task}: {title}"],
+            cwd=SIMULATOR_DIR,
+            check=False,
+        )
+
     return {
         "todo_tasks": remaining_tasks,
         "completed_tasks": [completed_task],
         "tests_passed": False,
         "retry_count": 0,
+        "tool_call_count": 0,
         "messages": [RemoveMessage(id=m.id) for m in state.get("messages", [])],
     }
 
@@ -177,71 +291,111 @@ def queue_evaluator(state: WorkflowState):
 
 
 def coder_router(state: WorkflowState):
+    if state.get("tool_call_count", 0) >= MAX_TOOL_CALLS:
+        return "tester"
     last = state["messages"][-1]
     return "tools" if last.tool_calls else "tester"
+
+
+def give_up_node(state: WorkflowState):
+    task = state["todo_tasks"][0] if state["todo_tasks"] else "unknown"
+    step_yaml = state.get("step_plans", {}).get(task, "No step plan found.")
+    print(f"\n>>> GIVING UP on '{task}' after {state.get('retry_count', 0)} failed attempts.")
+    print(f"\n>>> Step Plan:\n{step_yaml}")
+    print(f"\n>>> Last test output:\n{state.get('test_results', 'No output captured.')}")
+    diff = subprocess.run(
+        ["git", "diff"],
+        cwd=SIMULATOR_DIR,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    print(f"\n>>> Git diff:\n{diff.stdout}")
+    return {}
 
 
 # ==========================================
 # 4. GRAPH CONSTRUCTION
 # ==========================================
-def build_graph():
+def build_graph(checkpointer):
     workflow = StateGraph(WorkflowState)
 
+    workflow.add_node("planner", planner_node)
     workflow.add_node("coder", coder_node)
-    workflow.add_node("tools", ToolNode([write_rust_file, run_clippy, add_rust_dependency]))
+    workflow.add_node("coder_tools", ToolNode([read_rust_file, write_rust_file, run_clippy, add_rust_dependency]))
     workflow.add_node("tester", tester_node)
     workflow.add_node("queue_manager", queue_manager_node)
+    workflow.add_node("give_up", give_up_node)
 
-    workflow.set_entry_point("coder")
+    workflow.set_entry_point("planner")
 
-    workflow.add_conditional_edges("coder", coder_router, {"tools": "tools", "tester": "tester"})
-    workflow.add_edge("tools", "coder")
+    workflow.add_conditional_edges("planner", plan_evaluator, {"planner": "planner", "coder": "coder"})
+    workflow.add_conditional_edges("coder", coder_router, {"tools": "coder_tools", "tester": "tester"})
+    workflow.add_edge("coder_tools", "coder")
     workflow.add_conditional_edges(
         "tester",
         test_evaluator,
-        {"fail": "coder", "pass": "queue_manager", "give_up": END},
+        {"fail": "coder", "pass": "queue_manager", "give_up": "give_up"},
     )
+    workflow.add_edge("give_up", END)
     workflow.add_conditional_edges(
         "queue_manager", queue_evaluator, {"continue": "coder", "done": END}
     )
 
-    return workflow.compile(checkpointer=InMemorySaver())
+    return workflow.compile(checkpointer=checkpointer)
 
-
-app = build_graph()
 
 # ==========================================
 # 5. EXECUTION
 # ==========================================
 if __name__ == "__main__":
     initial_state = {
-        "goal": "Build an ARM64 functional simulator in Rust",
-        "todo_tasks": [
-            (
-                "Implement a Memory struct as a linear byte array [u8; 65536]. "
-                "Add a `fetch` method to the Cpu that reads 4 bytes from Memory at the current PC. "
-                "If the PC points to invalid memory, return a custom 'InvalidPC' error."
-            ),
-            (
-                "Implement an ELF loader using the `goblin` crate. "
-                "The loader must parse the binary, identify the entry point, "
-                "load segments into the Memory struct, and set the CPU's PC to the entry point. "
-                "Return a custom 'ElfLoadError' if the binary is malformed or invalid."
-            ),
-        ],
-        "completed_tasks": [
-            "Create the Cpu struct in src/cpu.rs with 32 general purpose registers."
-        ],
-        "architecture_spec": "Standard ARMv8 architecture.",
+        "goal": "Build an MVP ARM64 functional simulator that can load a bare-metal ELF, "
+                "execute a few arithmetic instructions, and stop on a halt instruction.",
+        "architecture_spec": (
+            "Target: ARMv8-A AArch64 (64-bit execution state). "
+            "Registers: 31 general-purpose 64-bit registers (X0–X30), SP, PC, PSTATE. "
+            "Memory model: flat, byte-addressable. "
+            "Instruction encoding: fixed 32-bit little-endian words. "
+            "Relevant instructions for MVP: ADD, SUB, MOV (wide immediate), LDR, STR, B, BL, RET, HLT."
+        ),
+        "plan_draft": None,
+        "plan_approved": False,
+        "plan_feedback": None,
+        "todo_tasks": [],
+        "completed_tasks": [],
+        "step_plans": {},
         "test_results": "",
         "messages": [],
         "tests_passed": False,
         "retry_count": 0,
+        "tool_call_count": 0,
     }
 
-    print("Starting LangGraph execution...")
-    for event in app.stream(initial_state, config={"configurable": {"thread_id": "main"}}):
-        for node_name, node_state in event.items():
-            print(f"\n--- Output from {node_name} ---")
-            if "messages" in node_state and node_state["messages"]:
-                print(node_state["messages"][-1].content)
+    config = {"configurable": {"thread_id": "arm64-sim-mvp-run-1"}}
+
+    with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
+        app = build_graph(checkpointer)
+
+        stream_input = initial_state
+
+        while True:
+            interrupted = False
+            interrupt_payload = None
+
+            for chunk in app.stream(stream_input, config, stream_mode="updates"):
+                if "__interrupt__" in chunk:
+                    interrupted = True
+                    interrupt_payload = chunk["__interrupt__"][0].value
+                else:
+                    for node_name, node_state in chunk.items():
+                        print(f"\n--- Output from {node_name} ---")
+                        if "messages" in node_state and node_state["messages"]:
+                            print(node_state["messages"][-1].content)
+
+            if not interrupted:
+                break
+
+            print(interrupt_payload)
+            user_response = input("Response: ")
+            stream_input = Command(resume=user_response)
