@@ -147,6 +147,26 @@ def run_clippy() -> str:
 
 
 @tool
+def run_tests() -> str:
+    """Runs `cargo test` and returns the full output. Use this to verify your implementation
+    is correct — clippy only checks compilation and linting, not test results."""
+    try:
+        result = subprocess.run(
+            ["cargo", "test", "--color=never"],
+            cwd=SIMULATOR_DIR,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        combined = f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        if result.returncode == 0:
+            return f"All tests passed.\n{combined}"
+        return f"Tests FAILED (exit {result.returncode}).\n{combined}"
+    except Exception as e:
+        return f"Failed to run tests: {e}"
+
+
+@tool
 def add_rust_dependency(crate_name: str) -> str:
     """Adds a dependency to the Rust project using cargo add."""
     try:
@@ -384,7 +404,7 @@ def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
         task = state["todo_tasks"][0] if state.get("todo_tasks") else "unknown"
         print(f"\n>>> [coder] working on: {task}")
         llm_with_tools = coder["llm"].bind_tools(
-            [read_rust_file, write_rust_file, run_clippy, add_rust_dependency]
+            [read_rust_file, write_rust_file, run_clippy, run_tests, add_rust_dependency]
         )
         history = _sanitize_history(list(state.get("messages") or []))
         system = SystemMessage(content=_build_system_prompt(state, coder["base_system_prompt"]))
@@ -432,7 +452,7 @@ def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
 
     workflow.add_node("planner", planner_node)
     workflow.add_node("coder", coder_node)
-    workflow.add_node("coder_tools", ToolNode([read_rust_file, write_rust_file, run_clippy, add_rust_dependency]))
+    workflow.add_node("coder_tools", ToolNode([read_rust_file, write_rust_file, run_clippy, run_tests, add_rust_dependency]))
     workflow.add_node("tester", tester_node)
     workflow.add_node("queue_manager", queue_manager_node)
     workflow.add_node("give_up", give_up_node)
