@@ -24,11 +24,52 @@ up to `MAX_TEST_RETRIES` times; if still failing, the run terminates with a stru
 
 ---
 
+## Configuration
+
+Model selection, system prompts, and node-level tuning live in `orchestrator/config.toml`,
+not in the script. The file has two sections:
+
+**`[llms.<name>]`** — one entry per model. The name is the model identifier (e.g.
+`deepseek-v4-pro`) and is used as the lookup key from node config.
+
+```toml
+[llms.deepseek-v4-pro]
+model = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"
+base_url = "https://api.deepseek.com/v1"
+```
+
+**`[nodes.<name>]`** — one entry per LLM-using node. Non-LLM nodes (`tester`,
+`queue_manager`) have no entry. Each node entry carries an `llm` reference plus
+any node-specific settings and prompts.
+
+```toml
+[nodes.planner]
+llm = "deepseek-v4-pro"
+system_prompt = "..."
+
+[nodes.coder]
+llm = "deepseek-v4-pro"
+max_tool_calls = 20
+base_system_prompt = "..."
+```
+
+At startup `load_config()` reads the TOML, builds an `llm_pool` dict mapping each
+name to a `ChatOpenAI` object, and validates that every `llm` reference in
+`[nodes.*]` exists in `[llms.*]` — failing fast before any graph work begins.
+
+`resolve_node(name, cfg, llm_pool)` is a helper called inside `build_graph`: it
+returns a plain dict for the named node with (a) the `llm` key replaced by the
+live `ChatOpenAI` object and (b) all string values stripped of leading/trailing
+whitespace.
+
+---
+
 ## Constants
 
 ```python
 MAX_TEST_RETRIES = 5   # max cargo test failures per task before terminating
-MAX_TOOL_CALLS = 20  # max coder→coder_tools cycles per task before forcing evaluation
+# MAX_TOOL_CALLS lives in config.toml under [nodes.coder] max_tool_calls
 ```
 
 ---
@@ -74,10 +115,11 @@ this state after every node so the run can be resumed after any failure.
 
 ## Nodes
 
-### `planner_node` *(planned)*
+### `planner_node`
 
 Reads `goal` and `architecture_spec` from state and uses an LLM to produce a structured
-multi-step plan. On each execution the node:
+multi-step plan. Defined as a closure inside `build_graph`, closing over the planner's
+`ChatOpenAI` object and `system_prompt` from config. On each execution the node:
 
 1. Reads `plan_draft` and `plan_feedback` from state (`plan_feedback` is `None` on the
    first call; human correction text on re-entry after feedback).
@@ -104,10 +146,14 @@ Reads `todo_tasks[0]` to identify the current step, then looks up its YAML plan 
 The LLM either calls a tool or returns a plain-text reply signalling it is done. Increments
 `tool_call_count` on each tool-calling response.
 
-The system prompt is rebuilt from state on every call via `_build_system_prompt()`, which
-includes `architecture_spec` and appends `test_results` when tests have not yet passed — so
-the coder always has the ISA constraints and failure context without them being injected as
-message roles.
+Defined as a closure inside `build_graph`, closing over the coder's `ChatOpenAI` object,
+`base_system_prompt`, and `max_tool_calls` from config.
+
+The system prompt is rebuilt from state on every call via `_build_system_prompt(state,
+base_prompt)`, which prepends `base_prompt` (the static coding standards from config) then
+appends `architecture_spec`, the current step plan, and `test_results` when tests have not
+yet passed — so the coder always has the ISA constraints and failure context without them
+being injected as message roles.
 
 ### `coder_tools`
 
@@ -315,31 +361,33 @@ content is automatically captured in every checkpoint.
 
 ### Thread ID strategy
 
-The `thread_id` is the persistent cursor into the checkpoint DB. Use a stable, human-readable
-ID per project run:
+The thread ID is derived automatically from the goal string:
 
 ```python
-config = {"configurable": {"thread_id": "arm64-sim-mvp-run-1"}}
+slug = hashlib.sha1(" ".join(goal.split()).encode()).hexdigest()[:8]
+thread_id = f"arm64-sim-{slug}"
 ```
 
-Reusing the same ID resumes the existing run. Using a new ID starts fresh.
+Whitespace in the goal is normalised before hashing so minor formatting differences
+don't produce different threads. The same goal always maps to the same thread and
+resumes the existing run; a different goal maps to a different thread and starts fresh
+with no manual intervention. Multiple completed threads accumulate in the same SQLite
+DB as an audit trail.
+
+**Goal mismatch guard:** on startup with an existing checkpoint, the stored `goal`
+is read from `channel_values` and compared to the CLI arg. If they differ (indicating
+a SHA1 collision, which is effectively impossible, or a bug) the run exits with a
+clear error rather than silently overwriting state.
 
 ### Initial state
 
-`goal` and `architecture_spec` are the only fields the caller must supply. Everything else
-starts at its zero value and is populated by the graph.
+`goal` (from the CLI) and `architecture_spec` are the only fields the caller must
+supply. Everything else starts at its zero value and is populated by the graph.
 
 ```python
 initial_state = {
-    "goal": "Build an MVP ARM64 functional simulator that can load a bare-metal ELF, "
-            "execute a few arithmetic instructions, and stop on a halt instruction.",
-    "architecture_spec": (
-        "Target: ARMv8-A AArch64 (64-bit execution state). "
-        "Registers: 31 general-purpose 64-bit registers (X0–X30), SP, PC, PSTATE. "
-        "Memory model: flat, byte-addressable. "
-        "Instruction encoding: fixed 32-bit little-endian words. "
-        "Relevant instructions for MVP: ADD, SUB, MOV (wide immediate), LDR, STR, B, BL, RET, HLT."
-    ),
+    "goal": goal,                # passed on the command line
+    "architecture_spec": "...", # ARMv8-A ISA description
     # zero values — populated by the graph
     "plan_draft": None,
     "plan_approved": False,
@@ -354,6 +402,22 @@ initial_state = {
     "tool_call_count": 0,
 }
 ```
+
+---
+
+## Invocation
+
+```
+python main.py "<goal>"           # fresh run or resume if checkpoint exists
+python main.py "<goal>" --reset   # discard existing checkpoint and start fresh
+```
+
+`goal` is a required positional argument. On resume the stored goal is verified
+against the CLI arg; a mismatch aborts with an error.
+
+`--reset` calls `reset_thread(thread_id)` which deletes rows for that thread from
+the `checkpoints` and `writes` tables in `checkpoints.db`. Other threads in the DB
+are unaffected. Running `--reset` on a thread that has no checkpoint is a no-op.
 
 ---
 
@@ -404,15 +468,21 @@ All components are implemented.
 
 | Component | Status |
 |---|---|
-| `coder_node` | Implemented |
+| `coder_node` (closure over LLM and config) | Implemented |
 | `coder_tools` (`read_rust_file`, `write_rust_file`, `run_clippy`, `add_rust_dependency`) | Implemented |
 | `tester_node` | Implemented |
 | `queue_manager_node` (message wipe, git commit with idempotency guard) | Implemented |
 | `give_up_node` (step YAML, test output, git diff) | Implemented |
 | `test_evaluator` with `MAX_TEST_RETRIES` guard | Implemented |
-| `coder_router` with `MAX_TOOL_CALLS` guard | Implemented |
+| `coder_router` with `max_tool_calls` guard (from config) | Implemented |
 | `SqliteSaver` checkpointer | Implemented |
-| `planner_node` with single-interrupt HITL loop | Implemented |
+| `planner_node` with single-interrupt HITL loop (closure over LLM and config) | Implemented |
 | `plan_evaluator` router (self-loop until approved) | Implemented |
 | `plan_draft` / `plan_approved` / `plan_feedback` / `tool_call_count` / `step_plans` in state | Implemented |
 | Driver loop with `app.stream()` and `Command(resume=...)` | Implemented |
+| `config.toml` with named LLM pool and per-node settings | Implemented |
+| `load_config()` with startup validation of LLM references | Implemented |
+| `resolve_node()` helper (resolves llm ref, strips strings) | Implemented |
+| CLI `goal` positional arg with SHA1-derived thread ID | Implemented |
+| `--reset` flag (`reset_thread()` deletes per-thread checkpoint rows) | Implemented |
+| Goal mismatch guard on resume | Implemented |
