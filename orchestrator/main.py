@@ -192,11 +192,14 @@ def tester_node(state: WorkflowState):
             check=False,
         )
         if result.returncode == 0:
+            print(result.stdout)
             return {
                 "test_results": f"Tests passed successfully.\n{result.stdout}",
                 "tests_passed": True,
                 "retry_count": 0,
             }
+        print(result.stdout)
+        print(result.stderr, file=sys.stderr)
         return {
             "test_results": f"Tests failed.\nSTDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}",
             "tests_passed": False,
