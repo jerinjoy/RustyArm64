@@ -10,7 +10,7 @@ import yaml
 from pathlib import Path
 from typing import Annotated, Dict, List, Optional, TypedDict
 
-from langchain_core.messages import BaseMessage, HumanMessage, RemoveMessage, SystemMessage
+from langchain_core.messages import AIMessage, BaseMessage, HumanMessage, RemoveMessage, SystemMessage, ToolMessage
 from langchain_core.tools import tool
 from langchain_openai import ChatOpenAI
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -347,13 +347,43 @@ def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
                 "plan_feedback": user_response,
             }
 
+    def _sanitize_history(messages: list) -> list:
+        """Drop any trailing AI message whose tool_calls have no matching ToolMessages.
+
+        This can happen when a checkpoint is saved after the coder node returns
+        a tool-call response but before the tool node executes — i.e. exactly
+        the state that causes the 400 "insufficient tool messages" error on
+        resume.  We truncate back to the last clean point so the LLM can retry.
+        """
+        # Build a set of tool_call_ids that are already resolved by a ToolMessage.
+        resolved: set[str] = set()
+        for m in messages:
+            if isinstance(m, ToolMessage) and m.tool_call_id:
+                resolved.add(m.tool_call_id)
+
+        # Walk backwards and drop any AIMessage with unresolved tool_call_ids.
+        clean = list(messages)
+        while clean:
+            last = clean[-1]
+            if isinstance(last, AIMessage) and last.tool_calls:
+                pending = [tc["id"] for tc in last.tool_calls if tc["id"] not in resolved]
+                if pending:
+                    print(
+                        f"\n>>> [coder] WARNING: dropping orphaned tool-call message "
+                        f"(ids: {pending}) from checkpoint — it was never executed."
+                    )
+                    clean.pop()
+                    continue
+            break
+        return clean
+
     def coder_node(state: WorkflowState):
         task = state["todo_tasks"][0] if state.get("todo_tasks") else "unknown"
         print(f"\n>>> [coder] working on: {task}")
         llm_with_tools = coder["llm"].bind_tools(
             [read_rust_file, write_rust_file, run_clippy, add_rust_dependency]
         )
-        history = list(state.get("messages") or [])
+        history = _sanitize_history(list(state.get("messages") or []))
         system = SystemMessage(content=_build_system_prompt(state, coder["base_system_prompt"]))
 
         # When the agent has used up its tool budget, inject a user turn so it
