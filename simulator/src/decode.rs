@@ -174,6 +174,57 @@ mod tests {
         assert_instruction_eq(&inst, &expected, "ADD W5, W6, #42");
     }
 
+    #[test]
+    fn test_decode_add_imm_shift() {
+        // ADD X0, X1, #5, LSL #12  →  0x91401420
+        // sf=1, op=0, S=0, sh=1, imm12=5, rn=1, rd=0
+        let inst = decode(0x9140_1420).expect("should decode ADD X0, X1, #5, LSL #12");
+        let expected = Instruction::AddSubImmediate {
+            sf: true,
+            op: false,
+            s: false,
+            rd: 0,
+            rn: 1,
+            imm12: 5,
+            shift: true,
+        };
+        assert_instruction_eq(&inst, &expected, "ADD X0, X1, #5, LSL #12");
+    }
+
+    #[test]
+    fn test_decode_add_32_shifted() {
+        // ADD W10, W11, #1, LSL #12  →  0x1140056A
+        // sf=0, op=0, S=0, sh=1, imm12=1, rn=11, rd=10
+        let inst = decode(0x1140_056A).expect("should decode ADD W10, W11, #1, LSL #12");
+        let expected = Instruction::AddSubImmediate {
+            sf: false,
+            op: false,
+            s: false,
+            rd: 10,
+            rn: 11,
+            imm12: 1,
+            shift: true,
+        };
+        assert_instruction_eq(&inst, &expected, "ADD W10, W11, #1, LSL #12");
+    }
+
+    #[test]
+    fn test_decode_add_max_imm12() {
+        // ADD X0, X0, #4095  →  0x913FFC00
+        // sf=1, op=0, S=0, sh=0, imm12=4095, rn=0, rd=0
+        let inst = decode(0x913F_FC00).expect("should decode ADD X0, X0, #4095");
+        let expected = Instruction::AddSubImmediate {
+            sf: true,
+            op: false,
+            s: false,
+            rd: 0,
+            rn: 0,
+            imm12: 4095,
+            shift: false,
+        };
+        assert_instruction_eq(&inst, &expected, "ADD X0, X0, #4095");
+    }
+
     // ── SUB immediate tests ───────────────────────────────────────────
 
     #[test]
@@ -208,6 +259,40 @@ mod tests {
             shift: false,
         };
         assert_instruction_eq(&inst, &expected, "SUB X10, X11, #1");
+    }
+
+    #[test]
+    fn test_decode_sub_32() {
+        // SUB W5, W6, #42  →  0x5100A8C5
+        // sf=0, op=1, S=0, sh=0, imm12=42, rn=6, rd=5
+        let inst = decode(0x5100_A8C5).expect("should decode SUB W5, W6, #42");
+        let expected = Instruction::AddSubImmediate {
+            sf: false,
+            op: true,
+            s: false,
+            rd: 5,
+            rn: 6,
+            imm12: 42,
+            shift: false,
+        };
+        assert_instruction_eq(&inst, &expected, "SUB W5, W6, #42");
+    }
+
+    #[test]
+    fn test_decode_sub_32_shifted() {
+        // SUB W20, W21, #7, LSL #12  →  0x51401EB4
+        // sf=0, op=1, S=0, sh=1, imm12=7, rn=21, rd=20
+        let inst = decode(0x5140_1EB4).expect("should decode SUB W20, W21, #7, LSL #12");
+        let expected = Instruction::AddSubImmediate {
+            sf: false,
+            op: true,
+            s: false,
+            rd: 20,
+            rn: 21,
+            imm12: 7,
+            shift: true,
+        };
+        assert_instruction_eq(&inst, &expected, "SUB W20, W21, #7, LSL #12");
     }
 
     // ── MOVZ tests ────────────────────────────────────────────────────
@@ -257,6 +342,98 @@ mod tests {
         assert_instruction_eq(&inst, &expected, "MOVZ X5, #1, LSL #48");
     }
 
+    #[test]
+    fn test_decode_movz_hw32() {
+        // MOVZ X8, #0xBEEF, LSL #32  →  0xD2D7DDE8
+        // sf=1, opc=2, hw=32, imm16=0xBEEF, rd=8
+        let inst = decode(0xD2D7_DDE8).expect("should decode MOVZ X8, #0xBEEF, LSL #32");
+        let expected = Instruction::MovWideImmediate {
+            sf: true,
+            opc: 2,
+            hw: 32,
+            imm16: 0xBEEF,
+            rd: 8,
+        };
+        assert_instruction_eq(&inst, &expected, "MOVZ X8, #0xBEEF, LSL #32");
+    }
+
+    #[test]
+    fn test_decode_movz_32() {
+        // MOVZ W0, #0x42, LSL #0  →  0x52800840
+        // sf=0, opc=2, hw=0, imm16=0x42, rd=0
+        let inst = decode(0x5280_0840).expect("should decode MOVZ W0, #0x42");
+        let expected = Instruction::MovWideImmediate {
+            sf: false,
+            opc: 2,
+            hw: 0,
+            imm16: 0x42,
+            rd: 0,
+        };
+        assert_instruction_eq(&inst, &expected, "MOVZ W0, #0x42");
+    }
+
+    #[test]
+    fn test_decode_movz_32_hw16() {
+        // MOVZ W3, #0xABCD, LSL #16  →  0x52B579A3
+        // sf=0, opc=2, hw=16, imm16=0xABCD, rd=3
+        let inst = decode(0x52B5_79A3).expect("should decode MOVZ W3, #0xABCD, LSL #16");
+        let expected = Instruction::MovWideImmediate {
+            sf: false,
+            opc: 2,
+            hw: 16,
+            imm16: 0xABCD,
+            rd: 3,
+        };
+        assert_instruction_eq(&inst, &expected, "MOVZ W3, #0xABCD, LSL #16");
+    }
+
+    // ── MOVN tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_decode_movn() {
+        // MOVN X0, #0x42  →  0x92800840
+        // sf=1, opc=0, hw=0, imm16=0x42, rd=0
+        let inst = decode(0x9280_0840).expect("should decode MOVN X0, #0x42");
+        let expected = Instruction::MovWideImmediate {
+            sf: true,
+            opc: 0,
+            hw: 0,
+            imm16: 0x42,
+            rd: 0,
+        };
+        assert_instruction_eq(&inst, &expected, "MOVN X0, #0x42");
+    }
+
+    #[test]
+    fn test_decode_movn_shifted() {
+        // MOVN X5, #0x1, LSL #48  →  0x92E00025
+        // sf=1, opc=0, hw=48, imm16=1, rd=5
+        let inst = decode(0x92E0_0025).expect("should decode MOVN X5, #1, LSL #48");
+        let expected = Instruction::MovWideImmediate {
+            sf: true,
+            opc: 0,
+            hw: 48,
+            imm16: 1,
+            rd: 5,
+        };
+        assert_instruction_eq(&inst, &expected, "MOVN X5, #1, LSL #48");
+    }
+
+    #[test]
+    fn test_decode_mov_wide_opc1() {
+        // Reserved opc=1 encoding — should still decode as MovWideImmediate.
+        // sf=1, opc=1, hw=0, imm16=0x42, rd=0  →  0xB2800840
+        let inst = decode(0xB280_0840).expect("should decode reserved opc=1 as MovWideImmediate");
+        let expected = Instruction::MovWideImmediate {
+            sf: true,
+            opc: 1,
+            hw: 0,
+            imm16: 0x42,
+            rd: 0,
+        };
+        assert_instruction_eq(&inst, &expected, "reserved opc=1 MOV wide");
+    }
+
     // ── MOVK tests ────────────────────────────────────────────────────
 
     #[test]
@@ -277,6 +454,21 @@ mod tests {
         assert_instruction_eq(&inst, &expected, "MOVK X7, #0xBEEF, LSL #32");
     }
 
+    #[test]
+    fn test_decode_movk_32() {
+        // MOVK W10, #0x1234, LSL #16  →  0x72A2468A
+        // sf=0, opc=3, hw=16, imm16=0x1234, rd=10
+        let inst = decode(0x72A2_468A).expect("should decode MOVK W10, #0x1234, LSL #16");
+        let expected = Instruction::MovWideImmediate {
+            sf: false,
+            opc: 3,
+            hw: 16,
+            imm16: 0x1234,
+            rd: 10,
+        };
+        assert_instruction_eq(&inst, &expected, "MOVK W10, #0x1234, LSL #16");
+    }
+
     // ── HLT tests ─────────────────────────────────────────────────────
 
     #[test]
@@ -293,6 +485,14 @@ mod tests {
         let inst = decode(0xD403_002A).expect("should decode HLT #42");
         let expected = Instruction::Hlt { imm16: 42 };
         assert_instruction_eq(&inst, &expected, "HLT #42");
+    }
+
+    #[test]
+    fn test_decode_hlt_max_imm() {
+        // HLT #65535  →  0xD403_FFFF
+        let inst = decode(0xD403_FFFF).expect("should decode HLT #65535");
+        let expected = Instruction::Hlt { imm16: 65535 };
+        assert_instruction_eq(&inst, &expected, "HLT #65535");
     }
 
     // ── Unknown instruction tests ─────────────────────────────────────
@@ -325,6 +525,25 @@ mod tests {
         // Word: 0xD220_0020 = 1101_0010_0010_0000_0000_0000_0010_0000
         let result = decode(0xD220_0020);
         assert_eq!(result, Err(DecodeError::UnknownOpcode(0xD220_0020)));
+    }
+
+    #[test]
+    fn test_decode_unknown_near_miss_add_sub() {
+        // Bits [28:24] == 0b10000 — one bit off from 0b10001.
+        // Word: 0x9000_0000 — bits[28:24] = 00000, bits[28:23] = 000000,
+        // bits[31:16] = 0x9000 ≠ 0xD403. Does not match any pattern.
+        let result = decode(0x9000_0000);
+        assert_eq!(result, Err(DecodeError::UnknownOpcode(0x9000_0000)));
+    }
+
+    #[test]
+    fn test_decode_unknown_all_ones() {
+        // 0xFFFF_FFFF — should not match any encoding.
+        // HLT: 0xFFFF >> 16 = 0xFFFF ≠ 0xD403
+        // ADD/SUB: (0xFFFF_FFFF >> 24) & 0x1F = 0x1F = 0b11111 ≠ 0b10001
+        // MOV wide: (0xFFFF_FFFF >> 23) & 0x3F = 0x7F ≠ 0b100101
+        let result = decode(0xFFFF_FFFF);
+        assert_eq!(result, Err(DecodeError::UnknownOpcode(0xFFFF_FFFF)));
     }
 
     // ── Edge-case tests ───────────────────────────────────────────────
@@ -362,10 +581,125 @@ mod tests {
     }
 
     #[test]
-    fn test_decode_invalid_word() {
-        // A word that matches no known pattern returns UnknownOpcode.
-        // 0xFFFF_FFFF should match nothing.
-        let result = decode(0xFFFF_FFFF);
-        assert_eq!(result, Err(DecodeError::UnknownOpcode(0xFFFF_FFFF)));
+    fn test_decode_add_rn_31_rd_31() {
+        // ADD XZR, XZR, #0  →  0x910003FF
+        // sf=1, op=0, S=0, sh=0, imm12=0, rn=31, rd=31
+        let inst = decode(0x9100_03FF).expect("should decode ADD XZR, XZR, #0");
+        let expected = Instruction::AddSubImmediate {
+            sf: true,
+            op: false,
+            s: false,
+            rd: 31,
+            rn: 31,
+            imm12: 0,
+            shift: false,
+        };
+        assert_instruction_eq(&inst, &expected, "ADD XZR, XZR, #0");
+    }
+
+    #[test]
+    fn test_decode_add_s_shifted() {
+        // ADDS X0, X1, #1, LSL #12  →  0xB1400420
+        // sf=1, op=0, S=1, sh=1, imm12=1, rn=1, rd=0
+        let inst = decode(0xB140_0420).expect("should decode ADDS X0, X1, #1, LSL #12");
+        let expected = Instruction::AddSubImmediate {
+            sf: true,
+            op: false,
+            s: true,
+            rd: 0,
+            rn: 1,
+            imm12: 1,
+            shift: true,
+        };
+        assert_instruction_eq(&inst, &expected, "ADDS X0, X1, #1, LSL #12");
+    }
+
+    #[test]
+    fn test_decode_subs_shifted() {
+        // SUBS X2, X3, #4095, LSL #12  →  0xF17FFC62
+        // sf=1, op=1, S=1, sh=1, imm12=4095, rn=3, rd=2
+        let inst = decode(0xF17F_FC62).expect("should decode SUBS X2, X3, #4095, LSL #12");
+        let expected = Instruction::AddSubImmediate {
+            sf: true,
+            op: true,
+            s: true,
+            rd: 2,
+            rn: 3,
+            imm12: 4095,
+            shift: true,
+        };
+        assert_instruction_eq(&inst, &expected, "SUBS X2, X3, #4095, LSL #12");
+    }
+
+    #[test]
+    fn test_decode_add_sub_reserved_shift_decodes_as_false() {
+        // shift field bits [23:22] = 0b10 (reserved). The decoder treats this
+        // as shift=false since only 0b01 is recognised as LSL #12.
+        // ADD X0, X1, #5 with sh=0b10 → word with bits[23:22]=10 but otherwise
+        // matching ADD: 0x91801420.
+        // Expected: decodes with shift=false (reserved shift value not
+        // validated at decode time).
+        let inst = decode(0x9180_1420).expect("should decode reserved sh=0b10");
+        assert_eq!(inst, Instruction::AddSubImmediate {
+            sf: true,
+            op: false,
+            s: false,
+            rd: 0,
+            rn: 1,
+            imm12: 5,
+            shift: false,
+        });
+    }
+
+    #[test]
+    fn test_decode_mov_wide_all_hw_values() {
+        // Verify all four hw values are decoded correctly.
+        // hw=0:  MOVZ X0, #0x1   → 0xD2800020
+        // hw=16: MOVZ X0, #0x1, LSL #16 → 0xD2A00020
+        // hw=32: MOVZ X0, #0x1, LSL #32 → 0xD2C00020
+        // hw=48: MOVZ X0, #0x1, LSL #48 → 0xD2E00020
+
+        let cases = [
+            (0xD280_0020u32, 0u8, "hw=0"),
+            (0xD2A0_0020, 16u8, "hw=16"),
+            (0xD2C0_0020, 32u8, "hw=32"),
+            (0xD2E0_0020, 48u8, "hw=48"),
+        ];
+
+        for &(word, expected_hw, desc) in &cases {
+            let inst = decode(word).unwrap_or_else(|_| panic!("should decode {}", desc));
+            assert_eq!(
+                inst,
+                Instruction::MovWideImmediate {
+                    sf: true,
+                    opc: 2,
+                    hw: expected_hw,
+                    imm16: 1,
+                    rd: 0,
+                },
+                "{}: expected hw={}, got {:?}",
+                desc,
+                expected_hw,
+                inst
+            );
+        }
+    }
+
+    #[test]
+    fn test_decode_error_debug() {
+        // Verify DecodeError implements Debug (required by assert_eq!).
+        let e = DecodeError::UnknownOpcode(0xDEAD_BEEF);
+        assert_eq!(format!("{:?}", e), "UnknownOpcode(3735928559)");
+        let e2 = DecodeError::IllegalEncoding;
+        assert_eq!(format!("{:?}", e2), "IllegalEncoding");
+    }
+
+    #[test]
+    fn test_decode_instruction_debug() {
+        // Verify Instruction implements Debug.
+        let ins = Instruction::Hlt { imm16: 42 };
+        let s = format!("{:?}", ins);
+        assert!(s.contains("Hlt"), "Debug output should contain variant name");
+        assert!(s.contains("42"), "Debug output should contain imm16 value");
     }
 }
