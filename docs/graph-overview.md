@@ -1,198 +1,17 @@
 # Orchestrator: LangGraph Design
 
-The orchestrator (`orchestrator/main.py`) uses [LangGraph](https://langchain-ai.github.io/langgraph/)
-to semi-autonomously build the ARM64 functional simulator in Rust. A human provides a high-level
-goal; the system plans, codes, tests, and iterates — pausing for human review at key decision points.
+This orchestrator uses [LangGraph](https://langchain-ai.github.io/langgraph/) to semi-autonomously build an ARM64 simulator in Rust. You give it a high-level goal; the graph plans, codes, and tests — pausing for your review before execution begins.
 
 ---
 
-## Phases
+## Mental model
 
-The system operates in two sequential phases within a single graph run:
+A **graph** in LangGraph is a set of **nodes** (Python functions) connected by **edges** (routing decisions). Every node reads from and writes to a shared **state** dict. LangGraph snapshots state after every node, so a run can be resumed from the last completed node after any crash.
 
-**Phase 1 — Planning**
-The planner node takes the goal, produces a structured multi-step plan, and enters a
-human-in-the-loop review loop. The human iterates with the planner (providing feedback,
-corrections, additional context) until the plan is approved. On approval the plan is committed
-to state and Phase 2 begins.
+This graph runs in two phases:
 
-**Phase 2 — Execution**
-The graph works through the approved task queue one step at a time. Each step is fully
-specified by a YAML plan (see [Step Plan Schema](#step-plan-schema)) that constrains the
-coder and minimises hallucination. After coding, tests are run. On failure the coder retries
-up to `MAX_TEST_RETRIES` times; if still failing, the run terminates with a structured failure summary for manual inspection.
-
----
-
-## Configuration
-
-Model selection, system prompts, and node-level tuning live in `orchestrator/config.toml`,
-not in the script. The file has two sections:
-
-**`[llms.<name>]`** — one entry per model. The name is the model identifier (e.g.
-`deepseek-v4-pro`) and is used as the lookup key from node config.
-
-```toml
-[llms.deepseek-v4-pro]
-model = "deepseek-v4-pro"
-api_key_env = "DEEPSEEK_API_KEY"
-base_url = "https://api.deepseek.com/v1"
-```
-
-**`[nodes.<name>]`** — one entry per LLM-using node. Non-LLM nodes (`tester`,
-`queue_manager`) have no entry. Each node entry carries an `llm` reference plus
-any node-specific settings and prompts.
-
-```toml
-[nodes.planner]
-llm = "deepseek-v4-pro"
-system_prompt = "..."
-
-[nodes.coder]
-llm = "deepseek-v4-pro"
-max_tool_calls = 20
-base_system_prompt = "..."
-```
-
-At startup `load_config()` reads the TOML, builds an `llm_pool` dict mapping each
-name to a `ChatOpenAI` object, and validates that every `llm` reference in
-`[nodes.*]` exists in `[llms.*]` — failing fast before any graph work begins.
-
-`resolve_node(name, cfg, llm_pool)` is a helper called inside `build_graph`: it
-returns a plain dict for the named node with (a) the `llm` key replaced by the
-live `ChatOpenAI` object and (b) all string values stripped of leading/trailing
-whitespace.
-
----
-
-## Constants
-
-```python
-MAX_TEST_RETRIES = 5   # max cargo test failures per task before terminating
-# MAX_TOOL_CALLS lives in config.toml under [nodes.coder] max_tool_calls
-```
-
----
-
-## State
-
-All nodes read from and write to a single `WorkflowState` dict. The checkpointer snapshots
-this state after every node so the run can be resumed after any failure.
-
-| Key | Type | Purpose |
-|---|---|---|
-| `goal` | `str` | Top-level objective provided at invocation; never changes |
-| `plan_draft` | `Optional[str]` | Current plan draft held between planner interrupt rounds |
-| `plan_approved` | `bool` | Set to `True` by `planner_node` on approval; gates entry to Phase 2 |
-| `plan_feedback` | `Optional[str]` | Human feedback from the last planner interrupt; written by `planner_node` on the feedback path, read and cleared on the next re-entry before the LLM call |
-| `todo_tasks` | `List[str]` | Step IDs remaining in the queue (last-write-wins — planner must always return the **full** list, not a partial update) |
-| `completed_tasks` | `List[str]` | Step IDs finished (append-only, reducer: `operator.add`) |
-| `step_plans` | `Dict[str, str]` | Maps step ID → raw YAML plan content (last-write-wins — planner must always return the **full** dict, not a partial update) |
-| `architecture_spec` | `str` | ISA description injected into every coder and planner prompt; provided at invocation time alongside `goal` and never modified by the graph |
-| `test_results` | `str` | Raw output from the last `cargo test` run |
-| `messages` | `List[BaseMessage]` | Conversation history for the current task (reducer: `add_messages`) |
-| `tests_passed` | `bool` | Set by `tester_node`; cleared by `queue_manager_node` |
-| `retry_count` | `int` | Test failure count for the current task (last-write-wins, no reducer) |
-| `tool_call_count` | `int` | Tool calls made during the current task (last-write-wins, no reducer) |
-
-> **`messages` lifecycle:** On a fresh task the list is empty. `coder_node` seeds it with a
-> `HumanMessage` so the full conversation is visible in checkpoints. `queue_manager_node` wipes
-> it with `RemoveMessage` before advancing on a passing task.
->
-> **`RemoveMessage` pattern:** The wipe must use
-> `[RemoveMessage(id=m.id) for m in state.get("messages", [])]`. LangGraph initialises all
-> TypedDict state fields to their zero values before any node runs, so `state["messages"]` is
-> always `[]` and never raises a `KeyError`; the `.get()` form is kept as defensive style.
-> Returning an empty list from the comprehension is a no-op. All messages that have passed
-> through the `add_messages` reducer are guaranteed to have an ID (the reducer assigns a UUID
-> if one is absent), so `m.id` is always safe to access.
-
-> **Reset responsibilities:** `queue_manager_node` resets `retry_count`, `tool_call_count`,
-> and `tests_passed` on a passing task. `planner_node` also resets `retry_count` and
-> `tool_call_count` on plan approval so that Phase 2 starts with a clean budget.
-
----
-
-## Nodes
-
-### `planner_node`
-
-Reads `goal` and `architecture_spec` from state and uses an LLM to produce a structured
-multi-step plan. Defined as a closure inside `build_graph`, closing over the planner's
-`ChatOpenAI` object and `system_prompt` from config. On each execution the node:
-
-1. Reads `plan_draft` and `plan_feedback` from state (`plan_feedback` is `None` on the
-   first call; human correction text on re-entry after feedback).
-2. Calls the LLM with `goal`, `architecture_spec`, the prior `plan_draft`, and any
-   `plan_feedback` to produce a revised draft; clears `plan_feedback` to `None`.
-3. Writes the revised draft to `plan_draft` in state.
-4. Calls `interrupt(plan_draft)` **once** to surface the draft to the human;
-   the **return value** of `interrupt()` is the human's resume input — whatever
-   was passed as `Command(resume=...)` when the graph was resumed.
-5. On resume, checks the human's response:
-   - **If the response is `"APPROVED"` (case-insensitive):** writes the finalised
-     `todo_tasks` and `step_plans` to state, sets `plan_approved = True`, clears
-     `plan_draft` to `None`, and resets `retry_count` and `tool_call_count` to 0.
-   - **Otherwise (any other string):** treats the response as feedback — writes it to
-     `plan_feedback` in state and returns. `plan_evaluator` routes the node back to itself.
-
-Calling `interrupt()` exactly once per node execution avoids LangGraph's replay behaviour,
-where re-entering a node replays all LLM calls made before previous `interrupt()` calls.
-
-### `coder_node`
-
-Reads `todo_tasks[0]` to identify the current step, then looks up its YAML plan in
-`step_plans`. Sends that plan, `architecture_spec`, and the conversation history to the LLM.
-The LLM either calls a tool or returns a plain-text reply signalling it is done. Increments
-`tool_call_count` on each tool-calling response.
-
-Defined as a closure inside `build_graph`, closing over the coder's `ChatOpenAI` object,
-`base_system_prompt`, and `max_tool_calls` from config.
-
-The system prompt is rebuilt from state on every call via `_build_system_prompt(state,
-base_prompt)`, which prepends `base_prompt` (the static coding standards from config) then
-appends `architecture_spec`, the current step plan, and `test_results` when tests have not
-yet passed — so the coder always has the ISA constraints and failure context without them
-being injected as message roles.
-
-### `coder_tools`
-
-LangGraph's built-in `ToolNode`. Executes whichever tool the coder requested and appends the
-result to `messages`. Has an unconditional return edge to `coder` — declare this explicitly
-with `workflow.add_edge("coder_tools", "coder")` in the graph definition (it does not appear
-in the routing table because it is not conditional).
-
-### `tester_node`
-
-Runs `cargo test --color=never`. On every execution writes `test_results` with the raw cargo
-output and sets `tests_passed = True` if the exit code is 0, `False` otherwise. On failure,
-also increments `retry_count`. Does not write to `messages`; failure context reaches the coder
-via `test_results` in the system prompt.
-
-### `queue_manager_node`
-
-Moves the completed step from `todo_tasks` to `completed_tasks`, resets `retry_count`,
-`tool_call_count`, and `tests_passed` to their zero values, and wipes `messages` via
-`RemoveMessage`. Performs a `git commit` of the simulator code so each completed step has a
-clean recovery point.
-
-> **Idempotency:** LangGraph gives at-least-once execution — if the SQLite checkpoint write
-> fails after the node's Python logic completes, the node re-runs on restart. The git commit
-> must be guarded:
-> ```
-> if git status --porcelain returns nothing → working tree already clean → skip commit
-> else → git add -A && git commit -m "complete {step_id}: {title}"
-> ```
-> `step_id` and `title` are read from the completed step's YAML plan. This makes the node
-> safe to re-run: a clean tree means the commit already happened, so the node skips the
-> commit and advances the queue.
-
-### `give_up_node`
-
-Fires when `retry_count >= MAX_TEST_RETRIES`. Reads `todo_tasks[0]` to identify the current step,
-then prints a structured failure summary — that step's YAML plan (from `step_plans`), the
-full `test_results`, and `git diff` of what the coder wrote — then routes to `END`. The run
-must be restarted manually after inspecting the output.
+1. **Planning** — the LLM proposes a multi-step plan; you review it and either approve or give feedback. The graph loops until you approve.
+2. **Execution** — the graph works through tasks one at a time: code → test → retry or advance.
 
 ---
 
@@ -200,289 +19,235 @@ must be restarted manually after inspecting the output.
 
 ```
 START ──► planner ◄──┐
-             │       │(feedback — write plan_feedback, re-enter)
-    [plan_evaluator]─┘
-         (APPROVED)
+             │       │ (feedback loop)
+   [plan_evaluator]  │
+       (approved) ───┘
              │
              ▼
-          coder ◄────────────────────────────────────────────┐
-             │                                               │
-       [coder_router]                                        │
-        ┌────┴──────────────────────────┐                    │
-  tool_calls present             no tool_calls               │
-  AND count < MAX_TOOL_CALLS     OR count >= MAX_TOOL_CALLS  │
-        │                        (forced evaluation)         │
-        ▼                               │                    │
-  coder_tools                           ▼                    │
-  │ (unconditional)                  tester                  │
-  └──────────────────► coder    [test_evaluator]             │
-                          (evaluated in order: 1→2→3)        │
-                   ┌──────────┬──────────────────┐           │
-                  (1)        (2)                 (3)          │
-                 pass    retry_count >= MAX      fail         │
-                   │       (give_up)               │          │
-                   ▼           │                   └──────────┘
-            queue_manager      ▼
-                   │         give_up
-           [queue_evaluator]   │
-            ┌──────┴──────┐   END
-         continue        done
-            │              │
-           coder           END
+          coder ◄───────────────────────────────────────┐
+             │                                           │
+       [coder_router]                                    │
+        ┌────┴─────────────────────────┐                 │
+   tool calls                    no more tool calls      │
+        │                             │                  │
+        ▼                             ▼                  │
+  coder_tools ──► coder            tester                │
+                              [test_evaluator]            │
+                           ┌──────┬──────────┐           │
+                         pass  too many     fail ─────────┘
+                           │    retries
+                           ▼       │
+                     queue_manager ▼
+                           │    give_up ──► END
+                   [queue_evaluator]
+                    ┌──────┴──────┐
+               tasks left     all done
+                    │              │
+                  coder           END
 ```
 
----
+### Routing
 
-## Routing Functions
-
-| Function | Source node | Logic |
-|---|---|---|
-| `plan_evaluator` | `planner` | `plan_approved` → `"coder"`, else `"planner"` (self-loop) |
-| `coder_router` | `coder` | (1) `tool_call_count >= MAX_TOOL_CALLS` → `"tester"`, (2) `last.tool_calls` → `"coder_tools"`, (3) else → `"tester"` (evaluated in this order) |
-| *(unconditional)* | `coder_tools` | always → `"coder"` (use `workflow.add_edge`, not `add_conditional_edges`) |
-| `test_evaluator` | `tester` | (1) `tests_passed` → `"queue_manager"`, (2) `retry_count >= MAX_TEST_RETRIES` → `"give_up"`, (3) else → `"coder"` (evaluated in this order) |
-| `queue_evaluator` | `queue_manager` | `todo_tasks` non-empty → `"coder"`, else `END` |
-
----
-
-## Tools Available to the Coder
-
-| Tool | What it does |
+| Router | Logic |
 |---|---|
-| `read_rust_file(filepath)` | Returns the current contents of a file inside `../simulator/` |
-| `write_rust_file(filepath, content)` | Writes a file inside `../simulator/` |
-| `run_clippy()` | Runs `cargo clippy` and returns warnings/errors |
-| `add_rust_dependency(crate_name)` | Runs `cargo add <crate>` |
+| `plan_evaluator` | `plan_approved` → `coder`; else → `planner` (self-loop) |
+| `coder_router` | last message has tool calls AND under budget → `coder_tools`; else → `tester` |
+| `test_evaluator` | pass → `queue_manager`; `retry_count >= MAX_TEST_RETRIES` → `give_up`; else → `coder` |
+| `queue_evaluator` | tasks remaining → `coder`; empty → `END` |
 
-The coder's system prompt requires it to:
-1. Call `read_rust_file` before any `action: modify` operation — never reconstruct an existing file from memory.
-2. Call `run_clippy` after every `write_rust_file` and fix all warnings before signalling done.
+`coder_tools → coder` is an **unconditional** edge — declared with `workflow.add_edge`, not `add_conditional_edges`.
 
 ---
 
-## Step Plan Schema
+## State
 
-Each entry in `step_plans` is a YAML string with the following structure. The schema is
-intentionally prescriptive to minimise coder hallucination.
+All nodes share a single `WorkflowState` TypedDict. LangGraph merges each node's return dict into state using **reducers** — functions that control how values combine rather than simply replace.
 
-```yaml
-id: "step_03_elf_loader"
-title: "Implement ELF loader"
-depends_on:
-  - "step_01_cpu"
-  - "step_02_memory"
+| Field | Type | Reducer | Purpose |
+|---|---|---|---|
+| `goal` | `str` | last-write-wins | Top-level objective; set at startup, never changes |
+| `plan_draft` | `Optional[str]` | last-write-wins | Current draft surfaced to the human; `None` after approval |
+| `plan_approved` | `bool` | last-write-wins | Gates entry to Phase 2 |
+| `plan_feedback` | `Optional[str]` | last-write-wins | Human correction text; cleared before each LLM call |
+| `todo_tasks` | `List[str]` | last-write-wins | Remaining step IDs; planner must always return the full list |
+| `completed_tasks` | `List[str]` | `operator.add` | Finished step IDs; each write *appends* rather than replaces |
+| `step_plans` | `Dict[str, str]` | last-write-wins | Step ID → YAML content; planner must always return the full dict |
+| `architecture_spec` | `str` | last-write-wins | ISA description injected into every LLM prompt; set at startup |
+| `messages` | `List[BaseMessage]` | `add_messages` | Coder conversation history; wiped between tasks |
+| `test_results` | `str` | last-write-wins | Raw `cargo test` output; injected into coder's system prompt on failure |
+| `tests_passed` | `bool` | last-write-wins | Set by `tester_node`; cleared by `queue_manager_node` |
+| `retry_count` | `int` | last-write-wins | Test failure count for the current task |
+| `tool_call_count` | `int` | last-write-wins | Tool calls used in the current task; enforces the per-node budget |
 
-deliverables:
-  files:
-    - path: "src/elf_loader.rs"
-      action: create          # create | modify
-    - path: "src/lib.rs"
-      action: modify
-      expected_additions:     # required for action: modify; list exact lines to add
-        - "pub mod elf_loader;"
-        - "pub use crate::elf_loader::{ElfLoader, ElfLoadError};"
+**Two fields use non-default reducers:**
 
-  types:
-    - name: "ElfLoader"
-      kind: struct
-      module: "crate::elf_loader"
-      fields:                   # required for structs; omit for enums
-        - name: "data"
-          type: "&'a [u8]"
-          visibility: pub
-    - name: "ElfLoadError"
-      kind: enum
-      module: "crate::elf_loader"
-      variants:
-        - name: "InvalidMagic"
-          description: "File does not start with ELF magic bytes."
-        - name: "UnsupportedArch"
-          description: "ELF target is not AArch64."
-        - name: "SegmentOutOfBounds"
-          description: "A LOAD segment exceeds the Memory address space."
+- `completed_tasks` uses `operator.add` — each node's return is appended, not replaced. This is how LangGraph accumulates a list across multiple nodes without one write clobbering another.
+- `messages` uses `add_messages` — LangGraph's built-in that merges by ID and handles `RemoveMessage` tombstones. `queue_manager_node` wipes the conversation between tasks with `[RemoveMessage(id=m.id) for m in state["messages"]]`.
 
-  functions:
-    - name: "ElfLoader::load"
-      module: "crate::elf_loader"
-      signature: "pub fn load(bytes: &[u8], cpu: &mut Cpu) -> Result<(), ElfLoadError>"
-      description: >
-        Parse the ELF header, verify magic and AArch64 machine type,
-        iterate LOAD segments and copy them into cpu.memory, then set
-        cpu.pc to the ELF entry point.
-      constraints:
-        - "Use the `goblin` crate — do not hand-roll ELF parsing."
-        - "Segments that map to address 0x0 are valid; do not treat as errors."
+---
 
-interface_contracts:
-  imports:
-    - "Cpu from crate::cpu — use cpu.memory and cpu.pc directly"
-    - "Memory from crate::memory — assumed to be [u8; 65536]"
-  exports:
-    - "ElfLoader::load — called by main.rs to bootstrap the simulator"
-    - "ElfLoadError — must implement Debug"
+## Nodes
 
-cargo_dependencies: []
+### `planner_node`
 
-tests:
-  - name: "test_load_valid_elf"
-    description: >
-      Build a minimal AArch64 ELF binary in the test, call ElfLoader::load,
-      assert cpu.pc equals the entry point and memory contains the segment bytes.
-  - name: "test_load_invalid_magic"
-    description: "Pass 16 zero bytes, assert Err(ElfLoadError::InvalidMagic)."
-  - name: "test_load_wrong_arch"
-    description: "Pass a valid x86-64 ELF, assert Err(ElfLoadError::UnsupportedArch)."
+The only node that pauses for human input. It:
 
-acceptance_criteria:
-  - "cargo clippy passes with no warnings"
-  - "All tests pass"
-  - "ElfLoader::load correctly sets cpu.pc to the ELF entry point"
+1. Calls the LLM with `goal`, `architecture_spec`, any prior `plan_draft`, and any `plan_feedback`.
+2. Calls `interrupt(revised_draft)` — this suspends the graph and surfaces the draft to the caller. The **return value** of `interrupt()` is whatever the human passes via `Command(resume=...)`.
+3. On `"APPROVED"`: parses the draft YAML into `step_plans` and `todo_tasks`, sets `plan_approved = True`.
+4. On any other input: stores it in `plan_feedback`. `plan_evaluator` routes back to `planner` for another revision.
+
+One `interrupt()` call per node execution is the key constraint — calling it multiple times causes LangGraph to replay prior LLM calls on re-entry.
+
+### `coder_node`
+
+Reads `todo_tasks[0]` and its YAML plan from `step_plans`, then invokes the LLM with tools bound. The system prompt is rebuilt on every call: it includes the static `base_system_prompt` from config, `architecture_spec`, the current step plan, and — on failure — the last `test_results`. This keeps failure context out of the message history and in the system prompt where it belongs.
+
+On the first call for a task, seeds `messages` with `HumanMessage("Begin the current task.")`. On subsequent calls, passes the full history so the LLM sees its prior tool use.
+
+### `coder_tools`
+
+LangGraph's built-in `ToolNode`. Executes the tool the coder requested and appends the result to `messages`. The unconditional edge back to `coder` means the LLM always sees the tool result before deciding its next action.
+
+Available tools: `read_rust_file`, `write_rust_file`, `run_clippy`, `add_rust_dependency`.
+
+### `tester_node`
+
+Runs `cargo test --color=never`. Writes `test_results` and sets `tests_passed`. On failure, increments `retry_count`. Does not touch `messages` — failure context reaches the coder via the system prompt on the next call.
+
+### `queue_manager_node`
+
+Advances the queue: moves `todo_tasks[0]` to `completed_tasks`, resets counters, wipes `messages`, and runs `git commit`. The commit is guarded by `git status --porcelain` — if the working tree is already clean the commit already happened (LangGraph gives at-least-once execution), so the node skips it safely.
+
+### `give_up_node`
+
+Fires when `retry_count >= MAX_TEST_RETRIES`. Prints the step's YAML plan, last test output, and `git diff`, then routes to `END`. The run must be restarted manually after inspecting the output.
+
+---
+
+## Configuration
+
+Model selection, prompts, and node settings live in `orchestrator/config.toml` rather than in the script.
+
+```toml
+[llms.deepseek-v4-pro]
+model       = "deepseek-v4-pro"
+api_key_env = "DEEPSEEK_API_KEY"
+base_url    = "https://api.deepseek.com/v1"
+
+[nodes.planner]
+llm           = "deepseek-v4-pro"
+system_prompt = "..."
+
+[nodes.coder]
+llm                = "deepseek-v4-pro"
+max_tool_calls     = 20
+base_system_prompt = "..."
 ```
 
+`load_config()` builds an `llm_pool` dict and validates that every `llm` reference in `[nodes.*]` exists in `[llms.*]`, failing fast before any graph work begins.
+
 ---
 
-## Persistence
+## Persistence & Resumption
 
-The graph is compiled with a **SqliteSaver checkpointer**. LangGraph writes a checkpoint after
-every node completes, so a restart with the same `thread_id` resumes from the last completed
-node rather than from scratch.
+The graph is compiled with a **SqliteSaver checkpointer**:
 
 ```python
-from langgraph.checkpoint.sqlite import SqliteSaver
-
 with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
     app = workflow.compile(checkpointer=checkpointer)
-    # run the driver loop inside this block so the connection stays open
 ```
 
-Step plan YAMLs are stored in `WorkflowState.step_plans` (a plain dict) rather than in a
-separate LangGraph Store. This keeps everything in one persistence backend and means plan
-content is automatically captured in every checkpoint.
+LangGraph writes a checkpoint after every node. If the process crashes, restarting with the same `thread_id` resumes from the last completed node.
 
-### Thread ID strategy
-
-The thread ID is derived automatically from the goal string:
+The thread ID is derived from the goal string so the same goal always resumes the same run:
 
 ```python
 slug = hashlib.sha1(" ".join(goal.split()).encode()).hexdigest()[:8]
 thread_id = f"arm64-sim-{slug}"
 ```
 
-Whitespace in the goal is normalised before hashing so minor formatting differences
-don't produce different threads. The same goal always maps to the same thread and
-resumes the existing run; a different goal maps to a different thread and starts fresh
-with no manual intervention. Multiple completed threads accumulate in the same SQLite
-DB as an audit trail.
-
-**Goal mismatch guard:** on startup with an existing checkpoint, the stored `goal`
-is read from `channel_values` and compared to the CLI arg. If they differ (indicating
-a SHA1 collision, which is effectively impossible, or a bug) the run exits with a
-clear error rather than silently overwriting state.
-
-### Initial state
-
-`goal` (from the CLI) and `architecture_spec` are the only fields the caller must
-supply. Everything else starts at its zero value and is populated by the graph.
-
-```python
-initial_state = {
-    "goal": goal,                # passed on the command line
-    "architecture_spec": "...", # ARMv8-A ISA description
-    # zero values — populated by the graph
-    "plan_draft": None,
-    "plan_approved": False,
-    "plan_feedback": None,
-    "todo_tasks": [],
-    "completed_tasks": [],
-    "step_plans": {},
-    "test_results": "",
-    "messages": [],
-    "tests_passed": False,
-    "retry_count": 0,
-    "tool_call_count": 0,
-}
-```
-
 ---
 
-## Invocation
+## Human-in-the-Loop
 
-```
-python main.py "<goal>"           # fresh run or resume if checkpoint exists
-python main.py "<goal>" --reset   # discard existing checkpoint and start fresh
-```
-
-`goal` is a required positional argument. On resume the stored goal is verified
-against the CLI arg; a mismatch aborts with an error.
-
-`--reset` calls `reset_thread(thread_id)` which deletes rows for that thread from
-the `checkpoints` and `writes` tables in `checkpoints.db`. Other threads in the DB
-are unaffected. Running `--reset` on a thread that has no checkpoint is a no-op.
-
----
-
-## Human-in-the-Loop Interactions
-
-The graph pauses using `interrupt()` inside `planner_node` for plan approval:
-
-The planner generates a draft, writes it to `plan_draft`, then calls `interrupt()` once to
-surface it. The human responds with feedback or the approval signal `"APPROVED"` (case-
-insensitive). Any other string is treated as feedback — written to `plan_feedback` and fed
-into the next LLM call. `plan_evaluator` routes back to `planner` on feedback or forwards to
-`coder` on approval.
-
-### Driver loop
-
-`app.stream()` with `stream_mode="updates"` is the correct method for HITL interrupt
-detection. When a node calls `interrupt()`, the stream yields a chunk whose key is
-`"__interrupt__"`, then the stream ends. To resume, pass `Command(resume=...)` as the
-next input to `app.stream()`.
+`interrupt()` inside `planner_node` suspends the graph. The driver loop detects this via the `"__interrupt__"` key in the stream and collects human input:
 
 ```python
-from langgraph.types import Command
-
 stream_input = initial_state
 
 while True:
     interrupted = False
-    interrupt_payload = None
-
     for chunk in app.stream(stream_input, config, stream_mode="updates"):
         if "__interrupt__" in chunk:
             interrupted = True
-            interrupt_payload = chunk["__interrupt__"][0].value
+            interrupt_payload = chunk["__interrupt__"][0].value  # the plan draft
 
     if not interrupted:
         break  # graph reached END
 
-    print(interrupt_payload)                  # show plan draft or failure summary
-    user_response = input("Response: ")       # collect feedback or approval
-    stream_input = Command(resume=user_response)
+    print(interrupt_payload)
+    user_response = input("Response: ")           # "APPROVED" or feedback text
+    stream_input = Command(resume=user_response)  # resume the suspended node
 ```
 
 ---
 
-## Implementation Status
+## Step Plan Schema
 
-All components are implemented.
+Each step the planner produces is a YAML document. The schema is prescriptive by design — the more the planner specifies, the less the coder hallucinates.
 
-| Component | Status |
-|---|---|
-| `coder_node` (closure over LLM and config) | Implemented |
-| `coder_tools` (`read_rust_file`, `write_rust_file`, `run_clippy`, `add_rust_dependency`) | Implemented |
-| `tester_node` | Implemented |
-| `queue_manager_node` (message wipe, git commit with idempotency guard) | Implemented |
-| `give_up_node` (step YAML, test output, git diff) | Implemented |
-| `test_evaluator` with `MAX_TEST_RETRIES` guard | Implemented |
-| `coder_router` with `max_tool_calls` guard (from config) | Implemented |
-| `SqliteSaver` checkpointer | Implemented |
-| `planner_node` with single-interrupt HITL loop (closure over LLM and config) | Implemented |
-| `plan_evaluator` router (self-loop until approved) | Implemented |
-| `plan_draft` / `plan_approved` / `plan_feedback` / `tool_call_count` / `step_plans` in state | Implemented |
-| Driver loop with `app.stream()` and `Command(resume=...)` | Implemented |
-| `config.toml` with named LLM pool and per-node settings | Implemented |
-| `load_config()` with startup validation of LLM references | Implemented |
-| `resolve_node()` helper (resolves llm ref, strips strings) | Implemented |
-| CLI `goal` positional arg with SHA1-derived thread ID | Implemented |
-| `--reset` flag (`reset_thread()` deletes per-thread checkpoint rows) | Implemented |
-| Goal mismatch guard on resume | Implemented |
+```yaml
+id: "step_03_elf_loader"
+title: "Implement ELF loader"
+depends_on: ["step_01_cpu", "step_02_memory"]
+
+deliverables:
+  files:
+    - path: "src/elf_loader.rs"
+      action: create              # create | modify
+    - path: "src/lib.rs"
+      action: modify
+      expected_additions:        # exact lines to add (required for modify)
+        - "pub mod elf_loader;"
+
+  types:
+    - name: "ElfLoadError"
+      kind: enum
+      variants:
+        - name: "InvalidMagic"
+          description: "File does not start with ELF magic bytes."
+
+  functions:
+    - name: "ElfLoader::load"
+      signature: "pub fn load(bytes: &[u8], cpu: &mut Cpu) -> Result<(), ElfLoadError>"
+      constraints:
+        - "Use the `goblin` crate — do not hand-roll ELF parsing."
+
+interface_contracts:
+  imports: ["Cpu from crate::cpu"]
+  exports:  ["ElfLoader::load", "ElfLoadError — must implement Debug"]
+
+cargo_dependencies: []
+
+tests:
+  - name: "test_load_valid_elf"
+    description: "Build a minimal AArch64 ELF, call load, assert pc == entry point."
+  - name: "test_load_invalid_magic"
+    description: "Pass 16 zero bytes, assert Err(ElfLoadError::InvalidMagic)."
+
+acceptance_criteria:
+  - "cargo clippy passes with no warnings"
+  - "All tests pass"
+```
+
+---
+
+## Running
+
+```
+python main.py "<goal>"           # fresh run, or resume if a checkpoint exists
+python main.py "<goal>" --reset   # discard the existing checkpoint and start fresh
+```
+
+`--reset` deletes rows for that thread from `checkpoints.db`. Other threads are unaffected.
