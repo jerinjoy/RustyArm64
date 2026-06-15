@@ -1,6 +1,10 @@
+import argparse
+import hashlib
 import operator
 import os
+import sqlite3
 import subprocess
+import sys
 import tomllib
 import yaml
 from pathlib import Path
@@ -17,10 +21,33 @@ from langgraph.types import Command, interrupt
 
 SIMULATOR_DIR = "../simulator"
 MAX_TEST_RETRIES = 5
+DB_PATH = "checkpoints.db"
 
 
 # ==========================================
-# 1. CONFIG
+# 1. CLI HELPERS
+# ==========================================
+def make_thread_id(goal: str) -> str:
+    """Derive a stable thread ID from the goal so each distinct goal gets its own checkpoint."""
+    normalized = " ".join(goal.split())
+    slug = hashlib.sha1(normalized.encode()).hexdigest()[:8]
+    return f"arm64-sim-{slug}"
+
+
+def reset_thread(thread_id: str) -> None:
+    """Delete all checkpoint rows for thread_id from the SQLite DB."""
+    if not os.path.exists(DB_PATH):
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        for table in ("checkpoints", "writes"):
+            try:
+                conn.execute(f"DELETE FROM {table} WHERE thread_id = ?", (thread_id,))
+            except sqlite3.OperationalError:
+                pass  # table doesn't exist yet
+
+
+# ==========================================
+# 2. CONFIG
 # ==========================================
 def load_config(path: Path = Path(__file__).parent / "config.toml"):
     with open(path, "rb") as f:
@@ -54,7 +81,7 @@ def resolve_node(name: str, cfg: dict, llm_pool: dict[str, ChatOpenAI]) -> dict:
 
 
 # ==========================================
-# 2. STATE DEFINITION
+# 3. STATE DEFINITION
 # ==========================================
 class WorkflowState(TypedDict):
     goal: str
@@ -73,7 +100,7 @@ class WorkflowState(TypedDict):
 
 
 # ==========================================
-# 3. TOOLS
+# 4. TOOLS
 # ==========================================
 @tool
 def read_rust_file(filepath: str) -> str:
@@ -124,7 +151,7 @@ def add_rust_dependency(crate_name: str) -> str:
 
 
 # ==========================================
-# 4. NODES (non-LLM — module-level)
+# 5. NODES (non-LLM — module-level)
 # ==========================================
 def _build_system_prompt(state: WorkflowState, base_prompt: str) -> str:
     architecture = state.get("architecture_spec", "No architecture spec provided.")
@@ -251,7 +278,7 @@ def give_up_node(state: WorkflowState):
 
 
 # ==========================================
-# 5. GRAPH CONSTRUCTION
+# 6. GRAPH CONSTRUCTION
 # ==========================================
 def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
     planner = resolve_node("planner", cfg, llm_pool)
@@ -365,14 +392,30 @@ def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
 
 
 # ==========================================
-# 6. EXECUTION
+# 7. EXECUTION
 # ==========================================
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="ARM64 simulator orchestrator")
+    parser.add_argument("goal", help="High-level goal for this run")
+    parser.add_argument(
+        "--reset",
+        action="store_true",
+        help="Discard any existing checkpoint for this goal and start fresh",
+    )
+    args = parser.parse_args()
+
+    goal = " ".join(args.goal.split())  # normalise whitespace
+    thread_id = make_thread_id(goal)
+    lg_config = {"configurable": {"thread_id": thread_id}}
+
+    if args.reset:
+        reset_thread(thread_id)
+        print(f">>> Reset: cleared checkpoint for thread '{thread_id}'")
+
     cfg, llm_pool = load_config()
 
     initial_state = {
-        "goal": "Build an MVP ARM64 functional simulator that can load a bare-metal ELF, "
-                "execute a few arithmetic instructions, and stop on a halt instruction.",
+        "goal": goal,
         "architecture_spec": (
             "Target: ARMv8-A AArch64 (64-bit execution state). "
             "Registers: 31 general-purpose 64-bit registers (X0–X30), SP, PC, PSTATE. "
@@ -393,18 +436,26 @@ if __name__ == "__main__":
         "tool_call_count": 0,
     }
 
-    config = {"configurable": {"thread_id": "arm64-sim-mvp-run-1"}}
+    with SqliteSaver.from_conn_string(DB_PATH) as checkpointer:
+        existing = checkpointer.get_tuple(lg_config)
+        if existing:
+            stored_goal = existing.checkpoint.get("channel_values", {}).get("goal")
+            if stored_goal and stored_goal != goal:
+                sys.exit(
+                    f"Error: checkpoint '{thread_id}' was created for a different goal.\n"
+                    f"  Stored : {stored_goal}\n"
+                    f"  Passed : {goal}\n"
+                    f"Pass --reset to discard it and start fresh."
+                )
 
-    with SqliteSaver.from_conn_string("checkpoints.db") as checkpointer:
         app = build_graph(checkpointer, cfg, llm_pool)
-
         stream_input = initial_state
 
         while True:
             interrupted = False
             interrupt_payload = None
 
-            for chunk in app.stream(stream_input, config, stream_mode="updates"):
+            for chunk in app.stream(stream_input, lg_config, stream_mode="updates"):
                 if "__interrupt__" in chunk:
                     interrupted = True
                     interrupt_payload = chunk["__interrupt__"][0].value
