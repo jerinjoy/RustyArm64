@@ -307,7 +307,8 @@ def build_graph(checkpointer, cfg: dict, llm_pool: dict[str, ChatOpenAI]):
 
         user_response = interrupt(revised_draft)
 
-        if user_response.strip().lower() == "approved":
+        _approval_keywords = {"approved", "approve", "yes", "y", "lgtm", "looks good", "go ahead", "ship it", "ok", "okay"}
+        if any(kw in user_response.strip().lower() for kw in _approval_keywords):
             step_plans = {}
             todo_tasks = []
             for doc in revised_draft.split("---"):
@@ -469,5 +470,9 @@ if __name__ == "__main__":
                 break
 
             print(interrupt_payload)
-            user_response = input("Response: ")
+            while True:
+                user_response = input("\nApprove plan? [yes] or type feedback to revise: ").strip()
+                if user_response:
+                    break
+                print("(no input — please type 'yes' to approve or enter feedback)")
             stream_input = Command(resume=user_response)
