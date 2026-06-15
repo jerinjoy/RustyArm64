@@ -106,8 +106,11 @@ class WorkflowState(TypedDict):
 def read_rust_file(filepath: str) -> str:
     """Reads and returns the contents of a file relative to the Rust project root."""
     full_path = os.path.join(SIMULATOR_DIR, filepath)
-    with open(full_path, "r") as f:
-        return f.read()
+    try:
+        with open(full_path, "r") as f:
+            return f.read()
+    except FileNotFoundError:
+        return f"File not found: {full_path}. Use write_rust_file to create it first."
 
 
 @tool
@@ -117,8 +120,11 @@ def write_rust_file(filepath: str, content: str) -> str:
     os.makedirs(
         os.path.dirname(full_path) if os.path.dirname(full_path) else ".", exist_ok=True
     )
-    with open(full_path, "w") as f:
-        f.write(content)
+    try:
+        with open(full_path, "w") as f:
+            f.write(content)
+    except OSError as e:
+        return f"Failed to write {full_path}: {e}"
     return f"Successfully wrote to {full_path}"
 
 
@@ -455,7 +461,7 @@ if __name__ == "__main__":
                 )
 
         app = build_graph(checkpointer, cfg, llm_pool)
-        stream_input = initial_state
+        stream_input = initial_state if not existing else None
 
         while True:
             interrupted = False
