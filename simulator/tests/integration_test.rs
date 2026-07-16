@@ -118,7 +118,7 @@ fn test_elf_execution() {
         "program should halt cleanly, got {:?}",
         result
     );
-    assert!(cpu.halted, "CPU should be halted");
+    assert!(cpu.is_halted(), "CPU should be halted");
 
     // Verify register state.
     assert_eq!(cpu.read_reg(0), 0x42, "X0 should be 0x42");

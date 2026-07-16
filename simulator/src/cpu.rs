@@ -29,11 +29,11 @@ impl std::error::Error for CpuError {}
 /// Represents the state of an ARMv8-A AArch64 CPU.
 pub struct Cpu {
     /// Architectural register file (X0–X30, SP, PC, flags).
-    pub regs: Registers,
+    regs: Registers,
     /// Physical memory.
     pub mem: Memory,
     /// True when the processor has halted (HLT executed).
-    pub halted: bool,
+    halted: bool,
 }
 
 impl Cpu {
@@ -118,18 +118,25 @@ impl Cpu {
         );
     }
 
+    /// Set the NZCV condition flags directly.
+    pub fn set_flags(&mut self, n: bool, z: bool, c: bool, v: bool) {
+        self.regs.set_flags(n, z, c, v);
+    }
+
+    /// Returns `true` if the CPU has executed a HLT instruction.
+    pub fn is_halted(&self) -> bool {
+        self.halted
+    }
+
     // ── Instruction execution ────────────────────────────────────────
 
     /// Fetch a 32-bit instruction from memory at the current PC.
     ///
     /// Reads 4 bytes in little-endian order. Does not advance PC.
     /// Returns `Err(CpuError::MemoryFault)` if the read goes out of bounds.
-    pub fn fetch(&self, mem: &[u8]) -> Result<u32, CpuError> {
-        let pc = self.read_pc() as usize;
-        if pc + 4 > mem.len() {
-            return Err(CpuError::MemoryFault(self.read_pc()));
-        }
-        Ok(u32::from_le_bytes(mem[pc..pc + 4].try_into().unwrap()))
+    pub fn fetch(&self) -> Result<u32, CpuError> {
+        let pc = self.read_pc();
+        self.mem.read_u32(pc).map_err(|_| CpuError::MemoryFault(pc))
     }
 
     /// Execute a decoded instruction, reading/writing registers and memory.
@@ -160,10 +167,7 @@ impl Cpu {
     /// `Err(CpuError::MemoryFault)` without modifying PC.
     pub fn step(&mut self) -> Result<(), CpuError> {
         let pc = self.read_pc();
-        let inst_word = self
-            .mem
-            .read_u32(pc)
-            .map_err(|_| CpuError::MemoryFault(pc))?;
+        let inst_word = self.fetch()?;
         let inst =
             decode::decode(inst_word).map_err(|_| CpuError::UnknownInstruction(inst_word))?;
         execute_instruction(&mut self.regs, &mut self.mem, &mut self.halted, inst)
@@ -193,10 +197,6 @@ impl Cpu {
                 Ok(()) => {}
                 Err(CpuError::Halt) => break,
                 Err(e) => return Err(e),
-            }
-
-            if self.halted {
-                break;
             }
         }
         Ok(())
@@ -380,10 +380,9 @@ mod tests {
     #[test]
     fn test_fetch_out_of_bounds() {
         // Memory has only 4 bytes; PC = 8 is out of bounds.
-        let mem = vec![0u8; 4];
         let mut cpu = Cpu::new(Memory::new(4));
         cpu.write_pc(8);
-        let result = cpu.fetch(&mem);
+        let result = cpu.fetch();
         assert!(matches!(result, Err(CpuError::MemoryFault(8))));
     }
 
@@ -549,7 +548,7 @@ mod tests {
             "program should halt cleanly, got {:?}",
             result
         );
-        assert!(cpu.halted, "CPU should be halted");
+        assert!(cpu.is_halted(), "CPU should be halted");
 
         assert_eq!(cpu.read_reg(0), 10);
         assert_eq!(cpu.read_reg(1), 20);
@@ -566,7 +565,7 @@ mod tests {
 
         let result = cpu.run();
         assert!(result.is_ok());
-        assert!(cpu.halted);
+        assert!(cpu.is_halted());
         // PC was incremented before execute, so it's 4.
         assert_eq!(cpu.read_pc(), 0x00);
     }
@@ -588,7 +587,7 @@ mod tests {
         cpu.write_reg(0, 0xDEAD_BEEF);
         cpu.write_sp(0x1000);
         cpu.write_pc(0x2000);
-        cpu.regs.set_flags(false, true, false, false);
+        cpu.set_flags(false, true, false, false);
 
         // We can't easily capture stdout, so just ensure it doesn't panic.
         cpu.print_registers();
