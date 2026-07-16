@@ -1,4 +1,24 @@
-use crate::error::MemoryError;
+use std::fmt;
+
+/// Errors that can occur during memory operations.
+#[derive(Debug)]
+pub enum MemoryError {
+    /// Address was out of valid range.
+    OutOfBounds(u64),
+    /// Access was misaligned.
+    Misaligned(u64),
+}
+
+impl fmt::Display for MemoryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::OutOfBounds(addr) => write!(f, "memory access out of bounds at 0x{addr:016x}"),
+            Self::Misaligned(addr) => write!(f, "misaligned memory access at 0x{addr:016x}"),
+        }
+    }
+}
+
+impl std::error::Error for MemoryError {}
 
 /// Flat byte‑addressable memory model.
 ///
