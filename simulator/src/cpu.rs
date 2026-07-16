@@ -127,11 +127,7 @@ impl Cpu {
         if pc + 4 > mem.len() {
             return Err(CpuError::MemoryFault(self.read_pc()));
         }
-        let b0 = mem[pc] as u32;
-        let b1 = mem[pc + 1] as u32;
-        let b2 = mem[pc + 2] as u32;
-        let b3 = mem[pc + 3] as u32;
-        Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+        Ok(u32::from_le_bytes(mem[pc..pc + 4].try_into().unwrap()))
     }
 
     /// Execute a decoded instruction, reading/writing registers and memory.

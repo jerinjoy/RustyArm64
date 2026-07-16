@@ -58,11 +58,9 @@ impl Memory {
         }
 
         let base = addr as usize;
-        let b0 = self.data[base] as u32;
-        let b1 = self.data[base + 1] as u32;
-        let b2 = self.data[base + 2] as u32;
-        let b3 = self.data[base + 3] as u32;
-        Ok(b0 | (b1 << 8) | (b2 << 16) | (b3 << 24))
+        Ok(u32::from_le_bytes(
+            self.data[base..base + 4].try_into().unwrap(),
+        ))
     }
 
     /// Write a `u32` value as four little‑endian bytes at the given address.
@@ -76,11 +74,7 @@ impl Memory {
         }
 
         let base = addr as usize;
-        self.data[base] = val as u8;
-        self.data[base + 1] = (val >> 8) as u8;
-        self.data[base + 2] = (val >> 16) as u8;
-        self.data[base + 3] = (val >> 24) as u8;
-        Ok(())
+        Ok(self.data[base..base + 4].copy_from_slice(&val.to_le_bytes()))
     }
 
     /// Write an arbitrary slice of bytes starting at the given address.

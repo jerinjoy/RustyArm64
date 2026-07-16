@@ -11,6 +11,7 @@
 /// * `write(31, _)` is a no-op (write to the zero register is discarded).
 /// * The stack pointer, program counter, and flags are accessed through
 ///   dedicated methods.
+#[derive(Default)]
 pub struct Registers {
     /// General-purpose registers X0–X30.
     pub x: [u64; 31],
@@ -134,12 +135,6 @@ impl Registers {
         ));
 
         lines.join("\n")
-    }
-}
-
-impl Default for Registers {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
