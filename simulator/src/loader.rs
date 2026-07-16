@@ -110,9 +110,8 @@ pub fn load_elf(memory: &mut Memory, elf_bytes: &[u8]) -> Result<u64, LoaderErro
                 .checked_add(file_sz)
                 .ok_or(LoaderError::SegmentDataOutOfBounds)?;
             let bss_size = (mem_sz - file_sz) as usize;
-            let zeros = vec![0u8; bss_size];
             memory
-                .write_bytes(bss_start, &zeros)
+                .fill_zeros(bss_start, bss_size)
                 .map_err(|_| LoaderError::SegmentDataOutOfBounds)?;
         }
 

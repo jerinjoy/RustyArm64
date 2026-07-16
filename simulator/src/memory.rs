@@ -100,6 +100,26 @@ impl Memory {
         self.data[base..base + data.len()].copy_from_slice(data);
         Ok(())
     }
+
+    /// Zero `size` bytes starting at `addr`.
+    ///
+    /// Returns `MemoryError::OutOfBounds` if the range extends past the end
+    /// of memory.
+    pub fn fill_zeros(&mut self, addr: u64, size: usize) -> Result<(), MemoryError> {
+        if size == 0 {
+            return Ok(());
+        }
+        let end = addr
+            .checked_add(size as u64)
+            .ok_or(MemoryError::OutOfBounds(addr))?;
+        let last = end - 1;
+        if last as usize >= self.data.len() {
+            return Err(MemoryError::OutOfBounds(addr));
+        }
+        let base = addr as usize;
+        self.data[base..base + size].fill(0);
+        Ok(())
+    }
 }
 
 #[cfg(test)]

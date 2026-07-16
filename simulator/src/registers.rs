@@ -14,19 +14,19 @@
 #[derive(Default)]
 pub struct Registers {
     /// General-purpose registers X0–X30.
-    pub x: [u64; 31],
+    x: [u64; 31],
     /// Stack pointer (SP / X31 in SP-aliasing contexts).
-    pub sp: u64,
+    sp: u64,
     /// Program counter.
-    pub pc: u64,
+    pc: u64,
     /// Condition flag: Negative.
-    pub n: bool,
+    n: bool,
     /// Condition flag: Zero.
-    pub z: bool,
+    z: bool,
     /// Condition flag: Carry.
-    pub c: bool,
+    c: bool,
     /// Condition flag: oVerflow.
-    pub v: bool,
+    v: bool,
 }
 
 impl Registers {
@@ -100,6 +100,16 @@ impl Registers {
     pub fn write_pc(&mut self, value: u64) {
         self.pc = value;
     }
+
+    /// Read the four condition flags (N, Z, C, V).
+    pub fn get_flags(&self) -> (bool, bool, bool, bool) {
+        (self.n, self.z, self.c, self.v)
+    }
+
+    pub fn n(&self) -> bool { self.n }
+    pub fn z(&self) -> bool { self.z }
+    pub fn c(&self) -> bool { self.c }
+    pub fn v(&self) -> bool { self.v }
 
     /// Set the four condition flags (N, Z, C, V).
     pub fn set_flags(&mut self, n: bool, z: bool, c: bool, v: bool) {

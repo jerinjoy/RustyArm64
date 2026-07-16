@@ -201,10 +201,10 @@ mod tests {
         execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
         assert_eq!(regs.read(0), 15);
         // Flags unchanged (S=0).
-        assert!(!regs.n);
-        assert!(!regs.z);
-        assert!(!regs.c);
-        assert!(!regs.v);
+        assert!(!regs.n());
+        assert!(!regs.z());
+        assert!(!regs.c());
+        assert!(!regs.v());
     }
 
     #[test]
@@ -476,10 +476,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 15);
-            assert!(!regs.n); // result positive
-            assert!(!regs.z); // result not zero
-            assert!(!regs.c); // no carry
-            assert!(!regs.v); // no overflow
+            assert!(!regs.n()); // result positive
+            assert!(!regs.z()); // result not zero
+            assert!(!regs.c()); // no carry
+            assert!(!regs.v()); // no overflow
         }
 
         // ── Case 2: ADD that produces zero ───────────────────────────
@@ -497,10 +497,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 0);
-            assert!(!regs.n);
-            assert!(regs.z); // Z=1
-            assert!(!regs.c); // no carry (0 + 0 = 0)
-            assert!(!regs.v);
+            assert!(!regs.n());
+            assert!(regs.z()); // Z=1
+            assert!(!regs.c()); // no carry (0 + 0 = 0)
+            assert!(!regs.v());
         }
 
         // ── Case 3: ADD with carry out (unsigned overflow) ───────────
@@ -518,10 +518,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 0); // wraps to 0
-            assert!(!regs.n);
-            assert!(regs.z); // result = 0
-            assert!(regs.c); // carry out
-            assert!(!regs.v); // no signed overflow
+            assert!(!regs.n());
+            assert!(regs.z()); // result = 0
+            assert!(regs.c()); // carry out
+            assert!(!regs.v()); // no signed overflow
         }
 
         // ── Case 4: ADD with signed overflow ─────────────────────────
@@ -539,10 +539,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 0x8000_0000_0000_0000); // negative
-            assert!(regs.n); // negative
-            assert!(!regs.z);
-            assert!(!regs.c); // no carry
-            assert!(regs.v); // signed overflow
+            assert!(regs.n()); // negative
+            assert!(!regs.z());
+            assert!(!regs.c()); // no carry
+            assert!(regs.v()); // signed overflow
         }
 
         // ── Case 5: SUB that sets carry (no borrow) ──────────────────
@@ -560,10 +560,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 5);
-            assert!(!regs.n);
-            assert!(!regs.z);
-            assert!(regs.c); // C=1 (no borrow: 10 >= 5)
-            assert!(!regs.v);
+            assert!(!regs.n());
+            assert!(!regs.z());
+            assert!(regs.c()); // C=1 (no borrow: 10 >= 5)
+            assert!(!regs.v());
         }
 
         // ── Case 6: SUB with borrow (C=0) ────────────────────────────
@@ -581,10 +581,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 0xFFFF_FFFF_FFFF_FFFEu64); // 3 - 5 = -2
-            assert!(regs.n);
-            assert!(!regs.z);
-            assert!(!regs.c); // borrow: 3 < 5, so C=0
-            assert!(!regs.v); // no signed overflow
+            assert!(regs.n());
+            assert!(!regs.z());
+            assert!(!regs.c()); // borrow: 3 < 5, so C=0
+            assert!(!regs.v()); // no signed overflow
         }
 
         // ── Case 7: SUB with signed overflow ─────────────────────────
@@ -602,10 +602,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 0x7FFF_FFFF_FFFF_FFFF); // positive
-            assert!(!regs.n);
-            assert!(!regs.z);
-            assert!(regs.c); // 0x8000... >= 1 → no borrow
-            assert!(regs.v); // signed overflow: negative - positive = positive
+            assert!(!regs.n());
+            assert!(!regs.z());
+            assert!(regs.c()); // 0x8000... >= 1 → no borrow
+            assert!(regs.v()); // signed overflow: negative - positive = positive
         }
 
         // ── Case 8: 32-bit addition, N reflects bit 31 ──────────────
@@ -624,10 +624,10 @@ mod tests {
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             // 0x7FFF_FFFF + 1 = 0x8000_0000 (negative in 32-bit)
             assert_eq!(regs.read(0), 0x8000_0000);
-            assert!(regs.n); // bit 31 set
-            assert!(!regs.z);
-            assert!(!regs.c); // no carry out of 32 bits
-            assert!(regs.v); // signed overflow
+            assert!(regs.n()); // bit 31 set
+            assert!(!regs.z());
+            assert!(!regs.c()); // no carry out of 32 bits
+            assert!(regs.v()); // signed overflow
         }
 
         // ── Case 9: 32-bit addition, C reflects bit 32 carry ────────
@@ -645,10 +645,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 0); // wraps to 0 in 32-bit
-            assert!(!regs.n);
-            assert!(regs.z);
-            assert!(regs.c); // carry out of 32 bits
-            assert!(!regs.v);
+            assert!(!regs.n());
+            assert!(regs.z());
+            assert!(regs.c()); // carry out of 32 bits
+            assert!(!regs.v());
         }
 
         // ── Case 10: 32-bit SUB, C reflects no borrow ────────────────
@@ -666,10 +666,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 5);
-            assert!(!regs.n);
-            assert!(!regs.z);
-            assert!(regs.c); // C=1: no borrow
-            assert!(!regs.v);
+            assert!(!regs.n());
+            assert!(!regs.z());
+            assert!(regs.c()); // C=1: no borrow
+            assert!(!regs.v());
         }
 
         // ── Case 11: 32-bit SUB with borrow ──────────────────────────
@@ -688,10 +688,10 @@ mod tests {
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             // 1 - 5 = -4 → 0xFFFF_FFFC in 32-bit, zero-extended to 64-bit
             assert_eq!(regs.read(0), 0xFFFF_FFFC);
-            assert!(regs.n); // negative
-            assert!(!regs.z);
-            assert!(!regs.c); // borrow: 1 < 5
-            assert!(!regs.v); // no signed overflow
+            assert!(regs.n()); // negative
+            assert!(!regs.z());
+            assert!(!regs.c()); // borrow: 1 < 5
+            assert!(!regs.v()); // no signed overflow
         }
 
         // ── Case 12: 32-bit SUB with signed overflow ─────────────────
@@ -710,10 +710,10 @@ mod tests {
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             // 0x8000_0000 - 1 = 0x7FFF_FFFF (positive in 32-bit)
             assert_eq!(regs.read(0), 0x7FFF_FFFF);
-            assert!(!regs.n); // positive
-            assert!(!regs.z);
-            assert!(regs.c); // 0x8000_0000 >= 1 → no borrow
-            assert!(regs.v); // signed overflow
+            assert!(!regs.n()); // positive
+            assert!(!regs.z());
+            assert!(regs.c()); // 0x8000_0000 >= 1 → no borrow
+            assert!(regs.v()); // signed overflow
         }
 
         // ── Case 13: ADD shifted with S=1 ────────────────────────────
@@ -732,10 +732,10 @@ mod tests {
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             // 0x7FFF_FFFF_FFFF_F000 + 0x1000 = 0x8000_0000_0000_0000
             assert_eq!(regs.read(0), 0x8000_0000_0000_0000);
-            assert!(regs.n); // negative
-            assert!(!regs.z);
-            assert!(!regs.c); // no carry
-            assert!(regs.v); // signed overflow
+            assert!(regs.n()); // negative
+            assert!(!regs.z());
+            assert!(!regs.c()); // no carry
+            assert!(regs.v()); // signed overflow
         }
 
         // ── Case 14: SUB shifted with S=1, carry set ─────────────────
@@ -753,10 +753,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 0x1000);
-            assert!(!regs.n);
-            assert!(!regs.z);
-            assert!(regs.c); // 0x2000 >= 0x1000
-            assert!(!regs.v);
+            assert!(!regs.n());
+            assert!(!regs.z());
+            assert!(regs.c()); // 0x2000 >= 0x1000
+            assert!(!regs.v());
         }
 
         // ── Case 15: S=0 should not modify flags ─────────────────────
@@ -777,10 +777,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             // Flags should remain unchanged.
-            assert!(regs.n);
-            assert!(regs.z);
-            assert!(regs.c);
-            assert!(regs.v);
+            assert!(regs.n());
+            assert!(regs.z());
+            assert!(regs.c());
+            assert!(regs.v());
         }
 
         // ── Case 16: ADD zero + zero with S=1 sets Z, clears N,C,V ──
@@ -800,10 +800,10 @@ mod tests {
             };
             execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
             assert_eq!(regs.read(0), 0);
-            assert!(!regs.n);
-            assert!(regs.z); // zero result
-            assert!(!regs.c); // no carry from 0+0
-            assert!(!regs.v); // no overflow
+            assert!(!regs.n());
+            assert!(regs.z()); // zero result
+            assert!(!regs.c()); // no carry from 0+0
+            assert!(!regs.v()); // no overflow
         }
     }
 

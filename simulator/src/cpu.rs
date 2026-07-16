@@ -99,21 +99,23 @@ impl Cpu {
     ///
     /// NZCV flags occupy bits [31:28]; all other bits are zero.
     pub fn read_pstate(&self) -> u64 {
-        let n = if self.regs.n { 1u64 << 31 } else { 0 };
-        let z = if self.regs.z { 1u64 << 30 } else { 0 };
-        let c = if self.regs.c { 1u64 << 29 } else { 0 };
-        let v = if self.regs.v { 1u64 << 28 } else { 0 };
-        n | z | c | v
+        let (n, z, c, v) = self.regs.get_flags();
+        (if n { 1u64 << 31 } else { 0 })
+            | (if z { 1u64 << 30 } else { 0 })
+            | (if c { 1u64 << 29 } else { 0 })
+            | (if v { 1u64 << 28 } else { 0 })
     }
 
     /// Write PSTATE from a packed `u64`.
     ///
     /// Only bits [31:28] are examined; other bits are ignored.
     pub fn write_pstate(&mut self, value: u64) {
-        self.regs.n = (value >> 31) & 1 == 1;
-        self.regs.z = (value >> 30) & 1 == 1;
-        self.regs.c = (value >> 29) & 1 == 1;
-        self.regs.v = (value >> 28) & 1 == 1;
+        self.regs.set_flags(
+            (value >> 31) & 1 == 1,
+            (value >> 30) & 1 == 1,
+            (value >> 29) & 1 == 1,
+            (value >> 28) & 1 == 1,
+        );
     }
 
     // ── Instruction execution ────────────────────────────────────────
