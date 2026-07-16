@@ -116,9 +116,12 @@ pub fn execute_instruction(
                     let mask = !(0xFFFFu64 << hw);
                     (existing & mask) | ((imm16 as u64) << hw)
                 }
+                0b00 => {
+                    // MOVN: bitwise-NOT of (imm16 shifted by hw).
+                    !((imm16 as u64) << hw)
+                }
                 _ => {
-                    // MOVN (opc == 0b00) and reserved encodings are
-                    // not implemented in this MVP; treat as no-op.
+                    // Reserved opc — treat as no-op.
                     return Ok(());
                 }
             };
@@ -1056,25 +1059,54 @@ mod tests {
     // ── MOVN / reserved opc ──────────────────────────────────────────
 
     #[test]
-    fn test_movn_no_op() {
-        // MOVN is not implemented; should leave registers unchanged.
+    fn test_movn_64_shift0() {
+        // MOVN X5, #0x42  →  ~0x42 = 0xFFFF_FFFF_FFFF_FFBD
         let (mut regs, mut mem, mut halted) = setup();
-        regs.write(5, 0xDEAD_BEEF);
 
         let ins = Instruction::MovWideImmediate {
             sf: true,
-            opc: 0, // MOVN
+            opc: 0,
             hw: 0,
             imm16: 0x42,
             rd: 5,
         };
 
-        let result = execute_instruction(&mut regs, &mut mem, &mut halted, ins);
-        assert_eq!(result, Ok(()));
-        // Register should be unchanged.
-        assert_eq!(regs.read(5), 0xDEAD_BEEF);
-        // halted should not be set.
-        assert!(!halted);
+        execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
+        assert_eq!(regs.read(5), !0x42u64);
+    }
+
+    #[test]
+    fn test_movn_64_shift16() {
+        // MOVN X0, #1, LSL #16  →  ~0x0001_0000 = 0xFFFF_FFFF_FFFE_FFFF
+        let (mut regs, mut mem, mut halted) = setup();
+
+        let ins = Instruction::MovWideImmediate {
+            sf: true,
+            opc: 0,
+            hw: 16,
+            imm16: 1,
+            rd: 0,
+        };
+
+        execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
+        assert_eq!(regs.read(0), !(1u64 << 16));
+    }
+
+    #[test]
+    fn test_movn_32() {
+        // MOVN W3, #0  →  ~0 in 32-bit = 0xFFFF_FFFF (zero-extended to 64-bit)
+        let (mut regs, mut mem, mut halted) = setup();
+
+        let ins = Instruction::MovWideImmediate {
+            sf: false,
+            opc: 0,
+            hw: 0,
+            imm16: 0,
+            rd: 3,
+        };
+
+        execute_instruction(&mut regs, &mut mem, &mut halted, ins).expect("should succeed");
+        assert_eq!(regs.read(3), 0xFFFF_FFFF);
     }
 
     #[test]
