@@ -90,8 +90,8 @@ fn test_elf_execution() {
     //
     // Little-endian bytes for each instruction:
     let movz_bytes = 0xD280_0840u32.to_le_bytes(); // [0x40, 0x08, 0x80, 0xD2]
-    let add_bytes = 0x9100_0401u32.to_le_bytes();  // [0x01, 0x04, 0x00, 0x91]
-    let hlt_bytes = 0xD403_0000u32.to_le_bytes();  // [0x00, 0x00, 0x03, 0xD4]
+    let add_bytes = 0x9100_0401u32.to_le_bytes(); // [0x01, 0x04, 0x00, 0x91]
+    let hlt_bytes = 0xD403_0000u32.to_le_bytes(); // [0x00, 0x00, 0x03, 0xD4]
 
     let mut seg: Vec<u8> = Vec::new();
     seg.extend_from_slice(&movz_bytes);
@@ -113,13 +113,17 @@ fn test_elf_execution() {
 
     // Run until halt.
     let result = cpu.run();
-    assert!(result.is_ok(), "program should halt cleanly, got {:?}", result);
+    assert!(
+        result.is_ok(),
+        "program should halt cleanly, got {:?}",
+        result
+    );
     assert!(cpu.halted, "CPU should be halted");
 
     // Verify register state.
     assert_eq!(cpu.read_reg(0), 0x42, "X0 should be 0x42");
     assert_eq!(cpu.read_reg(1), 0x43, "X1 should be 0x43 (X0 + 1)");
 
-    // PC should be entry + 12 (three 4-byte instructions).
-    assert_eq!(cpu.read_pc(), entry + 12, "PC should be entry + 12");
+    // PC should be entry + 8 (two 4-byte instructions).
+    assert_eq!(cpu.read_pc(), entry + 8, "PC should be entry + 12");
 }

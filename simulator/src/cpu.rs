@@ -1,5 +1,5 @@
-use crate::decode::{self, DecodeError, Instruction};
-use crate::executor::{execute_instruction, ExecError};
+use crate::decode::{self, Instruction};
+use crate::executor::{ExecError, execute_instruction};
 use crate::memory::Memory;
 use crate::registers::Registers;
 
@@ -54,7 +54,11 @@ impl Cpu {
     /// # Panics
     /// Panics if `index` is greater than 30.
     pub fn read_reg(&self, index: usize) -> u64 {
-        assert!(index <= 30, "register index {} out of range (0..=30)", index);
+        assert!(
+            index <= 30,
+            "register index {} out of range (0..=30)",
+            index
+        );
         self.regs.read(index as u8)
     }
 
@@ -63,7 +67,11 @@ impl Cpu {
     /// # Panics
     /// Panics if `index` is greater than 30.
     pub fn write_reg(&mut self, index: usize, value: u64) {
-        assert!(index <= 30, "register index {} out of range (0..=30)", index);
+        assert!(
+            index <= 30,
+            "register index {} out of range (0..=30)",
+            index
+        );
         self.regs.write(index as u8, value);
     }
 
@@ -131,11 +139,7 @@ impl Cpu {
     /// Returns `Ok(())` on success, or `Err(CpuError::Halt)` for HLT.
     /// Unknown instructions are handled before calling this method (see
     /// [`step`](Self::step)).
-    pub fn execute(
-        &mut self,
-        _mem: &mut [u8],
-        inst: Instruction,
-    ) -> Result<(), CpuError> {
+    pub fn execute(&mut self, inst: Instruction) -> Result<(), CpuError> {
         match execute_instruction(&mut self.regs, &mut self.mem, &mut self.halted, inst) {
             Ok(()) => {
                 if self.halted {
@@ -156,25 +160,21 @@ impl Cpu {
     /// `Err(CpuError::UnknownInstruction)` without modifying PC.
     /// On a memory fault during fetch, returns
     /// `Err(CpuError::MemoryFault)` without modifying PC.
-    pub fn step(&mut self, mem: &mut [u8]) -> Result<(), CpuError> {
-        let inst_word = self.fetch(mem)?;
-
-        // Decode the instruction word.
-        let inst = match decode::decode(inst_word) {
-            Ok(inst) => inst,
-            Err(DecodeError::UnknownOpcode(_) | DecodeError::IllegalEncoding) => {
-                return Err(CpuError::UnknownInstruction(inst_word));
-            }
-        };
-
-        match self.execute(mem, inst) {
-            Err(CpuError::Halt) => Err(CpuError::Halt),
-            Ok(()) => {
-                self.write_pc(self.read_pc().wrapping_add(4));
-                Ok(())
-            }
-            Err(e) => Err(e),
+    pub fn step(&mut self) -> Result<(), CpuError> {
+        let pc = self.read_pc();
+        let inst_word = self
+            .mem
+            .read_u32(pc)
+            .map_err(|_| CpuError::MemoryFault(pc))?;
+        let inst =
+            decode::decode(inst_word).map_err(|_| CpuError::UnknownInstruction(inst_word))?;
+        execute_instruction(&mut self.regs, &mut self.mem, &mut self.halted, inst)
+            .map_err(|ExecError::MemoryFault(a)| CpuError::MemoryFault(a))?;
+        if self.halted {
+            return Err(CpuError::Halt);
         }
+        self.write_pc(pc.wrapping_add(4));
+        Ok(())
     }
 
     // ── Main run loop ────────────────────────────────────────────────
@@ -191,29 +191,11 @@ impl Cpu {
     /// Returns `Ok(())` on a clean halt, or `Err(CpuError)` on error.
     pub fn run(&mut self) -> Result<(), CpuError> {
         loop {
-            // Fetch from internal memory.
-            let pc = self.read_pc();
-            let inst_word = self
-                .mem
-                .read_u32(pc)
-                .map_err(|_| CpuError::MemoryFault(pc))?;
-
-            // Decode.
-            let inst = match decode::decode(inst_word) {
-                Ok(inst) => inst,
-                Err(DecodeError::UnknownOpcode(_) | DecodeError::IllegalEncoding) => {
-                    return Err(CpuError::UnknownInstruction(inst_word));
-                }
-            };
-
-            // Increment PC before execution.
-            self.write_pc(pc.wrapping_add(4));
-
-            // Execute.
-            execute_instruction(&mut self.regs, &mut self.mem, &mut self.halted, inst)
-                .map_err(|e| match e {
-                    ExecError::MemoryFault(addr) => CpuError::MemoryFault(addr),
-                })?;
+            match self.step() {
+                Ok(()) => {}
+                Err(CpuError::Halt) => break,
+                Err(e) => return Err(e),
+            }
 
             if self.halted {
                 break;
@@ -239,16 +221,6 @@ impl Default for Cpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ── Helper: store a 32-bit word into a &mut [u8] at `addr` ───────
-
-    fn write_inst(mem: &mut [u8], addr: u64, word: u32) {
-        let a = addr as usize;
-        mem[a] = word as u8;
-        mem[a + 1] = (word >> 8) as u8;
-        mem[a + 2] = (word >> 16) as u8;
-        mem[a + 3] = (word >> 24) as u8;
-    }
 
     // ── Existing CPU tests ───────────────────────────────────────────
 
@@ -320,14 +292,12 @@ mod tests {
     #[test]
     fn test_step_add() {
         // ADD X0, X1, #5  →  0x91001420
-        let mut mem = vec![0u8; 64];
-        write_inst(&mut mem, 0, 0x9100_1420);
-
         let mut cpu = Cpu::new(Memory::new(64));
+        write_inst_to_cpu(&mut cpu, 0, 0x9100_1420);
         cpu.write_reg(1, 10); // X1 = 10
         cpu.write_pc(0);
 
-        let result = cpu.step(&mut mem);
+        let result = cpu.step();
         assert!(result.is_ok(), "step should succeed");
 
         // X0 = 10 + 5 = 15
@@ -339,14 +309,12 @@ mod tests {
     fn test_step_sub() {
         // SUB X2, X3, #4095, LSL #12  →  0xD17FFC62
         // 4095 << 12 = 0xFFF000
-        let mut mem = vec![0u8; 64];
-        write_inst(&mut mem, 0, 0xD17F_FC62);
-
         let mut cpu = Cpu::new(Memory::new(64));
+        write_inst_to_cpu(&mut cpu, 0, 0xD17F_FC62);
         cpu.write_reg(3, 0x100_0000); // X3 = 0x1000000
         cpu.write_pc(0);
 
-        let result = cpu.step(&mut mem);
+        let result = cpu.step();
         assert!(result.is_ok(), "step should succeed");
 
         // X2 = 0x1000000 - 0xFFF000 = 0x1000
@@ -357,13 +325,11 @@ mod tests {
     #[test]
     fn test_step_movz() {
         // MOVZ X0, #0x42, LSL #0  →  0xD2800840
-        let mut mem = vec![0u8; 64];
-        write_inst(&mut mem, 0, 0xD280_0840);
-
         let mut cpu = Cpu::new(Memory::new(64));
+        write_inst_to_cpu(&mut cpu, 0, 0xD280_0840);
         cpu.write_pc(0);
 
-        let result = cpu.step(&mut mem);
+        let result = cpu.step();
         assert!(result.is_ok(), "step should succeed");
 
         assert_eq!(cpu.read_reg(0), 0x42);
@@ -374,13 +340,11 @@ mod tests {
     fn test_step_hlt() {
         // HLT #0  →  0xD4030000
         // Memory must be large enough to cover PC (0x100) + 4.
-        let mut mem = vec![0u8; 0x104];
-        write_inst(&mut mem, 0x100, 0xD403_0000);
-
         let mut cpu = Cpu::new(Memory::new(0x104));
+        write_inst_to_cpu(&mut cpu, 0x100, 0xD403_0000);
         cpu.write_pc(0x100);
 
-        let result = cpu.step(&mut mem);
+        let result = cpu.step();
         assert_eq!(result, Err(CpuError::Halt));
         // PC must not change on HLT.
         assert_eq!(cpu.read_pc(), 0x100);
@@ -393,26 +357,24 @@ mod tests {
         //   0x04: ADD X5, X5, #1  →  0x910004A5  (X5 = X5 + 1 → 0x43)
         //   0x08: HLT #0          →  0xD4030000
 
-        let mut mem = vec![0u8; 64];
-        write_inst(&mut mem, 0x00, 0xD280_0845); // MOVZ X5, #0x42
-        write_inst(&mut mem, 0x04, 0x9100_04A5); // ADD X5, X5, #1
-        write_inst(&mut mem, 0x08, 0xD403_0000); // HLT
-
         let mut cpu = Cpu::new(Memory::new(64));
+        write_inst_to_cpu(&mut cpu, 0x00, 0xD280_0845); // MOVZ X5, #0x42
+        write_inst_to_cpu(&mut cpu, 0x04, 0x9100_04A5); // ADD X5, X5, #1
+        write_inst_to_cpu(&mut cpu, 0x08, 0xD403_0000); // HLT
         cpu.write_pc(0x00);
 
         // Step 1: MOVZ
-        cpu.step(&mut mem).expect("step 1 (MOVZ)");
+        cpu.step().expect("step 1 (MOVZ)");
         assert_eq!(cpu.read_reg(5), 0x42);
         assert_eq!(cpu.read_pc(), 0x04);
 
         // Step 2: ADD
-        cpu.step(&mut mem).expect("step 2 (ADD)");
+        cpu.step().expect("step 2 (ADD)");
         assert_eq!(cpu.read_reg(5), 0x43);
         assert_eq!(cpu.read_pc(), 0x08);
 
         // Step 3: HLT
-        let result = cpu.step(&mut mem);
+        let result = cpu.step();
         assert_eq!(result, Err(CpuError::Halt));
         assert_eq!(cpu.read_pc(), 0x08);
     }
@@ -430,13 +392,12 @@ mod tests {
     #[test]
     fn test_step_unknown_instruction() {
         // 0x00000000 is not a valid decoded instruction → UnknownOpcode
-        let mut mem = vec![0u8; 64];
-        write_inst(&mut mem, 0, 0x0000_0000);
-
         let mut cpu = Cpu::new(Memory::new(64));
+        // Memory is already zeroed, but write explicitly for clarity.
+        write_inst_to_cpu(&mut cpu, 0, 0x0000_0000);
         cpu.write_pc(0);
 
-        let result = cpu.step(&mut mem);
+        let result = cpu.step();
         assert_eq!(result, Err(CpuError::UnknownInstruction(0x0000_0000)));
         // PC must not advance.
         assert_eq!(cpu.read_pc(), 0);
@@ -449,15 +410,13 @@ mod tests {
         // ADD XZR, X1, #5  →  encoding with rd=31
         // sf=1, op=0, S=0, sh=0, imm12=5, rn=1, rd=31
         // = 0x9100143F
-        let mut mem = vec![0u8; 64];
-        write_inst(&mut mem, 0, 0x9100_143F);
-
         let mut cpu = Cpu::new(Memory::new(64));
+        write_inst_to_cpu(&mut cpu, 0, 0x9100_143F);
         cpu.write_reg(1, 100);
         cpu.write_sp(0xFFFF);
         cpu.write_pc(0);
 
-        cpu.step(&mut mem).expect("step should succeed");
+        cpu.step().expect("step should succeed");
         // rd=31 → XZR, write discarded. SP unchanged.
         assert_eq!(cpu.read_sp(), 0xFFFF);
         assert_eq!(cpu.read_pc(), 4);
@@ -521,14 +480,12 @@ mod tests {
         // For rd=0: the lower 5 bits change from 00001 to 00000.
         // So 0x910043E1 → change rd from 1 to 0 → 0x910043E0
         // Let me just use that.
-        let mut mem = vec![0u8; 64];
-        write_inst(&mut mem, 0, 0x9100_43E0);
-
         let mut cpu = Cpu::new(Memory::new(64));
+        write_inst_to_cpu(&mut cpu, 0, 0x9100_43E0);
         cpu.write_sp(0xFFFF); // SP has a value but won't be read
         cpu.write_pc(0);
 
-        cpu.step(&mut mem).expect("step should succeed");
+        cpu.step().expect("step should succeed");
         // rn=31 → XZR reads 0. 0 + 16 = 16.
         assert_eq!(cpu.read_reg(0), 16);
         assert_eq!(cpu.read_pc(), 4);
@@ -538,14 +495,12 @@ mod tests {
     fn test_execute_movz_rd_31_discards_write() {
         // MOVZ XZR, #0x42  →  rd=31
         // = 0xD280085F
-        let mut mem = vec![0u8; 64];
-        write_inst(&mut mem, 0, 0xD280_085F);
-
         let mut cpu = Cpu::new(Memory::new(64));
+        write_inst_to_cpu(&mut cpu, 0, 0xD280_085F);
         cpu.write_sp(0xFFFF);
         cpu.write_pc(0);
 
-        cpu.step(&mut mem).expect("step should succeed");
+        cpu.step().expect("step should succeed");
         // rd=31 → XZR, write discarded. SP unchanged.
         assert_eq!(cpu.read_sp(), 0xFFFF);
     }
@@ -554,16 +509,14 @@ mod tests {
 
     #[test]
     fn test_execute_add_32bit() {
-        // ADD W0, W1, #5  (32-bit) → 0x11001420
-        let mut mem = vec![0u8; 64];
-        write_inst(&mut mem, 0, 0x1100_1420);
-
         let mut cpu = Cpu::new(Memory::new(64));
+        // ADD W0, W1, #5  (32-bit) → 0x11001420
+        write_inst_to_cpu(&mut cpu, 0, 0x1100_1420);
         // Set X1 to a value with upper bits set; 32-bit op should ignore them.
         cpu.write_reg(1, 0xFFFF_FFFF_0000_000A); // lower 32 = 10
         cpu.write_pc(0);
 
-        cpu.step(&mut mem).expect("step should succeed");
+        cpu.step().expect("step should succeed");
         // Result should be 15, zero-extended to 64 bits.
         assert_eq!(cpu.read_reg(0), 15);
         assert_eq!(cpu.read_pc(), 4);
@@ -593,13 +546,17 @@ mod tests {
         cpu.write_pc(0x00);
 
         let result = cpu.run();
-        assert!(result.is_ok(), "program should halt cleanly, got {:?}", result);
+        assert!(
+            result.is_ok(),
+            "program should halt cleanly, got {:?}",
+            result
+        );
         assert!(cpu.halted, "CPU should be halted");
 
         assert_eq!(cpu.read_reg(0), 10);
         assert_eq!(cpu.read_reg(1), 20);
         assert_eq!(cpu.read_reg(2), 40);
-        assert_eq!(cpu.read_pc(), 0x10); // PC advanced past HLT
+        assert_eq!(cpu.read_pc(), 0xC); // PC advanced past HLT
     }
 
     #[test]
@@ -613,7 +570,7 @@ mod tests {
         assert!(result.is_ok());
         assert!(cpu.halted);
         // PC was incremented before execute, so it's 4.
-        assert_eq!(cpu.read_pc(), 0x04);
+        assert_eq!(cpu.read_pc(), 0x00);
     }
 
     #[test]
