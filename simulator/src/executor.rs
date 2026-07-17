@@ -1,5 +1,5 @@
 use crate::decode::Instruction;
-use crate::memory::Memory;
+use crate::memory::PhysicalMemory;
 use crate::registers::Registers;
 
 /// Errors that can occur during instruction execution.
@@ -24,7 +24,7 @@ pub enum ExecError {
 /// * `Err(ExecError::MemoryFault)` for out-of-bounds memory accesses.
 pub fn execute_instruction(
     regs: &mut Registers,
-    _mem: &mut Memory,
+    _mem: &mut PhysicalMemory,
     halted: &mut bool,
     ins: Instruction,
 ) -> Result<(), ExecError> {
@@ -149,8 +149,8 @@ mod tests {
 
     /// Helper: create a fresh pair of registers and memory (1 KiB)
     /// plus a halt flag.
-    fn setup() -> (Registers, Memory, bool) {
-        (Registers::new(), Memory::new(1024), false)
+    fn setup() -> (Registers, PhysicalMemory, bool) {
+        (Registers::new(), PhysicalMemory::new(), false)
     }
 
     // ── HLT ──────────────────────────────────────────────────────────

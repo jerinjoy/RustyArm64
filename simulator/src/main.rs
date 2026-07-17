@@ -4,7 +4,7 @@ use std::process;
 
 use arm64_simulator::cpu::Cpu;
 use arm64_simulator::loader::load_elf;
-use arm64_simulator::memory::Memory;
+use arm64_simulator::memory::PhysicalMemory;
 
 fn main() {
     let args: Vec<String> = env::args().collect();
@@ -24,9 +24,7 @@ fn main() {
         }
     };
 
-    // Allocate memory (16 MiB for MVP).
-    let mem_size: usize = 16 * 1024 * 1024;
-    let mut memory = Memory::new(mem_size);
+    let mut memory = PhysicalMemory::new();
 
     // Load the ELF into memory.
     let entry_point = match load_elf(&mut memory, &elf_bytes) {

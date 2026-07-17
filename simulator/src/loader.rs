@@ -1,10 +1,10 @@
 use std::fmt;
 
+use goblin::elf::Elf;
 use goblin::elf::header;
 use goblin::elf::program_header;
-use goblin::elf::Elf;
 
-use crate::memory::Memory;
+use crate::memory::PhysicalMemory;
 
 /// Errors that can occur during ELF loading.
 #[derive(Debug, PartialEq, Eq)]
@@ -41,10 +41,10 @@ impl std::error::Error for LoaderError {}
 ///
 /// This function parses the ELF, validates that it is a 64-bit little-endian
 /// AArch64 executable, copies all `PT_LOAD` segments into memory via
-/// [`Memory::write_bytes`], and returns the ELF entry point address.
+/// [`PhysicalMemory::write_bytes`], and returns the ELF entry point address.
 ///
 /// No relocations or dynamic linking are performed.
-pub fn load_elf(memory: &mut Memory, elf_bytes: &[u8]) -> Result<u64, LoaderError> {
+pub fn load_elf(memory: &mut PhysicalMemory, elf_bytes: &[u8]) -> Result<u64, LoaderError> {
     // Quick pre-check: ELF magic + minimum size for identification fields.
     if elf_bytes.len() < 20 {
         return Err(LoaderError::Truncated);
@@ -234,16 +234,20 @@ mod tests {
         let elf_bytes = build_elf(entry, &segment);
 
         // Allocate enough memory to cover the segment.
-        let mem_size = (entry as usize) + segment.len() + 0x1000;
-        let mut memory = Memory::new(mem_size);
+        let mut memory = PhysicalMemory::new();
 
         let result = load_elf(&mut memory, &elf_bytes);
         assert!(result.is_ok(), "valid AArch64 ELF should load successfully");
         assert_eq!(result.unwrap(), entry);
 
         // Verify segment data was written to memory.
-        let word = memory.read_u32(entry).expect("entry address should be in bounds");
-        assert_eq!(word, 0xD65F03C0, "memory should contain the RET instruction");
+        let word = memory
+            .read_u32(entry)
+            .expect("entry address should be in bounds");
+        assert_eq!(
+            word, 0xD65F03C0,
+            "memory should contain the RET instruction"
+        );
     }
 
     #[test]
@@ -252,7 +256,7 @@ mod tests {
         let segment = [0x90u8; 4]; // NOP sled
         let elf_bytes = build_elf_with_machine(0x400000, &segment, 0x3E);
 
-        let mut memory = Memory::new(0x10000);
+        let mut memory = PhysicalMemory::new();
         let result = load_elf(&mut memory, &elf_bytes);
         assert!(result.is_err(), "non-ARM64 ELF should be rejected");
         assert_eq!(result.unwrap_err(), LoaderError::UnsupportedArch);
@@ -263,7 +267,7 @@ mod tests {
         let segment = [0x00u8; 4];
         let elf_bytes = build_32bit_elf(0x10000, &segment);
 
-        let mut memory = Memory::new(0x20000);
+        let mut memory = PhysicalMemory::new();
         let result = load_elf(&mut memory, &elf_bytes);
         assert!(result.is_err(), "32-bit ELF should be rejected");
         assert_eq!(result.unwrap_err(), LoaderError::UnsupportedArch);
@@ -275,7 +279,7 @@ mod tests {
         let entry = 0x8000_0000u64;
         let elf_bytes = build_elf(entry, &segment);
 
-        let mut memory = Memory::new(0x1_0000_0000); // large enough
+        let mut memory = PhysicalMemory::new(); // large enough
         let got_entry = load_elf(&mut memory, &elf_bytes).expect("valid ELF should load");
         assert_eq!(got_entry, entry, "entry point should match e_entry field");
     }
@@ -284,7 +288,7 @@ mod tests {
     fn test_load_truncated_file() {
         // Just a few bytes — not a valid ELF.
         let data = [0x7fu8, b'E', b'L', b'F'];
-        let mut memory = Memory::new(0x1000);
+        let mut memory = PhysicalMemory::new();
         let result = load_elf(&mut memory, &data);
         assert!(result.is_err(), "truncated ELF should produce an error");
     }
@@ -292,7 +296,7 @@ mod tests {
     #[test]
     fn test_load_non_elf_file() {
         let data = [0u8; 128];
-        let mut memory = Memory::new(0x1000);
+        let mut memory = PhysicalMemory::new();
         let result = load_elf(&mut memory, &data);
         assert!(result.is_err(), "non-ELF data should produce an error");
         assert_eq!(result.unwrap_err(), LoaderError::NotElf);

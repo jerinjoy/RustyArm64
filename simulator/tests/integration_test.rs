@@ -1,6 +1,6 @@
 use arm64_simulator::cpu::Cpu;
 use arm64_simulator::loader::load_elf;
-use arm64_simulator::memory::Memory;
+use arm64_simulator::memory::PhysicalMemory;
 
 /// Build a minimal ARM64 ELF64 executable with the given instructions.
 ///
@@ -101,7 +101,7 @@ fn test_elf_execution() {
     let elf_bytes = build_minimal_elf(&seg);
 
     // Allocate memory large enough: entry (0x400000) + segment (12 bytes) + margin.
-    let mut memory = Memory::new(0x410000);
+    let mut memory = PhysicalMemory::new();
 
     // Load the ELF.
     let entry = load_elf(&mut memory, &elf_bytes).expect("ELF should load successfully");

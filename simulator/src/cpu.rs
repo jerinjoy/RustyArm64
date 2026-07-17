@@ -1,6 +1,6 @@
 use crate::decode::{self, Instruction};
 use crate::executor::{ExecError, execute_instruction};
-use crate::memory::Memory;
+use crate::memory::PhysicalMemory;
 use crate::registers::Registers;
 
 /// Errors that can occur during CPU execution.
@@ -10,7 +10,7 @@ pub enum CpuError {
     Halt,
     /// An unrecognized instruction word was encountered.
     UnknownInstruction(u32),
-    /// Memory access at the given address was out of bounds.
+    /// PhysicalMemory access at the given address was out of bounds.
     MemoryFault(u64),
 }
 
@@ -31,7 +31,7 @@ pub struct Cpu {
     /// Architectural register file (X0–X30, SP, PC, flags).
     regs: Registers,
     /// Physical memory.
-    pub mem: Memory,
+    pub mem: PhysicalMemory,
     /// True when the processor has halted (HLT executed).
     halted: bool,
 }
@@ -39,7 +39,7 @@ pub struct Cpu {
 impl Cpu {
     /// Create a new CPU with the given memory, all registers zeroed,
     /// PC = 0, and `halted = false`.
-    pub fn new(memory: Memory) -> Self {
+    pub fn new(memory: PhysicalMemory) -> Self {
         Self {
             regs: Registers::new(),
             mem: memory,
@@ -212,7 +212,7 @@ impl Cpu {
 
 impl Default for Cpu {
     fn default() -> Self {
-        Self::new(Memory::new(0))
+        Self::new(PhysicalMemory::new())
     }
 }
 
@@ -224,7 +224,7 @@ mod tests {
 
     #[test]
     fn test_new_cpu_all_zero() {
-        let cpu = Cpu::new(Memory::new(64));
+        let cpu = Cpu::new(PhysicalMemory::new());
         for i in 0..=30 {
             assert_eq!(cpu.read_reg(i), 0, "register X{} should be 0", i);
         }
@@ -235,7 +235,7 @@ mod tests {
 
     #[test]
     fn test_write_and_read_reg() {
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         cpu.write_reg(0, 0xDEAD_BEEF);
         assert_eq!(cpu.read_reg(0), 0xDEAD_BEEF);
 
@@ -245,21 +245,21 @@ mod tests {
 
     #[test]
     fn test_write_and_read_sp() {
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         cpu.write_sp(0xFFFF_0000);
         assert_eq!(cpu.read_sp(), 0xFFFF_0000);
     }
 
     #[test]
     fn test_write_and_read_pc() {
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         cpu.write_pc(0x8000);
         assert_eq!(cpu.read_pc(), 0x8000);
     }
 
     #[test]
     fn test_write_and_read_pstate() {
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         // Set N=1, Z=1, C=0, V=0 via packed PSTATE.
         cpu.write_pstate(0xA000_0000); // N=1, Z=1
         assert_eq!(cpu.read_pstate(), 0xA000_0000);
@@ -274,14 +274,14 @@ mod tests {
     #[test]
     #[should_panic(expected = "register index 31 out of range")]
     fn test_read_reg_out_of_range() {
-        let cpu = Cpu::new(Memory::new(64));
+        let cpu = Cpu::new(PhysicalMemory::new());
         cpu.read_reg(31);
     }
 
     #[test]
     #[should_panic(expected = "register index 31 out of range")]
     fn test_write_reg_out_of_range() {
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         cpu.write_reg(31, 0);
     }
 
@@ -290,7 +290,7 @@ mod tests {
     #[test]
     fn test_step_add() {
         // ADD X0, X1, #5  →  0x91001420
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0, 0x9100_1420);
         cpu.write_reg(1, 10); // X1 = 10
         cpu.write_pc(0);
@@ -307,7 +307,7 @@ mod tests {
     fn test_step_sub() {
         // SUB X2, X3, #4095, LSL #12  →  0xD17FFC62
         // 4095 << 12 = 0xFFF000
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0, 0xD17F_FC62);
         cpu.write_reg(3, 0x100_0000); // X3 = 0x1000000
         cpu.write_pc(0);
@@ -323,7 +323,7 @@ mod tests {
     #[test]
     fn test_step_movz() {
         // MOVZ X0, #0x42, LSL #0  →  0xD2800840
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0, 0xD280_0840);
         cpu.write_pc(0);
 
@@ -337,8 +337,8 @@ mod tests {
     #[test]
     fn test_step_hlt() {
         // HLT #0  →  0xD4030000
-        // Memory must be large enough to cover PC (0x100) + 4.
-        let mut cpu = Cpu::new(Memory::new(0x104));
+        // PhysicalMemory must be large enough to cover PC (0x100) + 4.
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0x100, 0xD403_0000);
         cpu.write_pc(0x100);
 
@@ -355,7 +355,7 @@ mod tests {
         //   0x04: ADD X5, X5, #1  →  0x910004A5  (X5 = X5 + 1 → 0x43)
         //   0x08: HLT #0          →  0xD4030000
 
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0x00, 0xD280_0845); // MOVZ X5, #0x42
         write_inst_to_cpu(&mut cpu, 0x04, 0x9100_04A5); // ADD X5, X5, #1
         write_inst_to_cpu(&mut cpu, 0x08, 0xD403_0000); // HLT
@@ -379,8 +379,8 @@ mod tests {
 
     #[test]
     fn test_fetch_out_of_bounds() {
-        // Memory has only 4 bytes; PC = 8 is out of bounds.
-        let mut cpu = Cpu::new(Memory::new(4));
+        // PhysicalMemory has only 4 bytes; PC = 8 is out of bounds.
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         cpu.write_pc(8);
         let result = cpu.fetch();
         assert!(matches!(result, Err(CpuError::MemoryFault(8))));
@@ -389,8 +389,8 @@ mod tests {
     #[test]
     fn test_step_unknown_instruction() {
         // 0x00000000 is not a valid decoded instruction → UnknownOpcode
-        let mut cpu = Cpu::new(Memory::new(64));
-        // Memory is already zeroed, but write explicitly for clarity.
+        let mut cpu = Cpu::new(PhysicalMemory::new());
+        // PhysicalMemory is already zeroed, but write explicitly for clarity.
         write_inst_to_cpu(&mut cpu, 0, 0x0000_0000);
         cpu.write_pc(0);
 
@@ -407,7 +407,7 @@ mod tests {
         // ADD XZR, X1, #5  →  encoding with rd=31
         // sf=1, op=0, S=0, sh=0, imm12=5, rn=1, rd=31
         // = 0x9100143F
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0, 0x9100_143F);
         cpu.write_reg(1, 100);
         cpu.write_sp(0xFFFF);
@@ -477,7 +477,7 @@ mod tests {
         // For rd=0: the lower 5 bits change from 00001 to 00000.
         // So 0x910043E1 → change rd from 1 to 0 → 0x910043E0
         // Let me just use that.
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0, 0x9100_43E0);
         cpu.write_sp(0xFFFF); // SP has a value but won't be read
         cpu.write_pc(0);
@@ -492,7 +492,7 @@ mod tests {
     fn test_execute_movz_rd_31_discards_write() {
         // MOVZ XZR, #0x42  →  rd=31
         // = 0xD280085F
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0, 0xD280_085F);
         cpu.write_sp(0xFFFF);
         cpu.write_pc(0);
@@ -506,7 +506,7 @@ mod tests {
 
     #[test]
     fn test_execute_add_32bit() {
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         // ADD W0, W1, #5  (32-bit) → 0x11001420
         write_inst_to_cpu(&mut cpu, 0, 0x1100_1420);
         // Set X1 to a value with upper bits set; 32-bit op should ignore them.
@@ -534,7 +534,7 @@ mod tests {
         //   0x08: ADD X2, X1, #20   → 0x91005022  (X2 = X1 + 20 = 40)
         //   0x0C: HLT #0            → 0xD4030000
 
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0x00, 0xD2800140); // MOVZ X0, #10
         write_inst_to_cpu(&mut cpu, 0x04, 0xD2800281); // MOVZ X1, #20
         write_inst_to_cpu(&mut cpu, 0x08, 0x91005022); // ADD X2, X1, #20
@@ -559,7 +559,7 @@ mod tests {
     #[test]
     fn test_run_halt_clean() {
         // Single HLT at PC=0.
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0x00, 0xD4030000); // HLT #0
         cpu.write_pc(0x00);
 
@@ -573,7 +573,7 @@ mod tests {
     #[test]
     fn test_run_unknown_instruction() {
         // 0x00000000 is not valid.
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         write_inst_to_cpu(&mut cpu, 0x00, 0x0000_0000);
         cpu.write_pc(0x00);
 
@@ -583,7 +583,7 @@ mod tests {
 
     #[test]
     fn test_print_registers_non_empty() {
-        let mut cpu = Cpu::new(Memory::new(64));
+        let mut cpu = Cpu::new(PhysicalMemory::new());
         cpu.write_reg(0, 0xDEAD_BEEF);
         cpu.write_sp(0x1000);
         cpu.write_pc(0x2000);

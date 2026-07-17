@@ -1,4 +1,8 @@
-use std::fmt;
+use std::{collections::HashMap, fmt};
+
+const PAGE_SIZE_4K_OFFSET: usize = 12;
+const PAGE_SIZE_4K_MASK: usize = (1 << PAGE_SIZE_4K_OFFSET) - 1;
+const PAGE_SIZE_4K: usize = 1 << PAGE_SIZE_4K_OFFSET;
 
 /// Errors that can occur during memory operations.
 #[derive(Debug)]
@@ -20,31 +24,14 @@ impl fmt::Display for MemoryError {
 
 impl std::error::Error for MemoryError {}
 
-/// Flat byte‑addressable memory model.
-///
-/// Stores memory as a `Vec<u8>` and provides helpers for little‑endian
-/// 32‑bit reads and writes with bounds checking.
-#[derive(Debug)]
-pub struct Memory {
-    data: Vec<u8>,
+#[derive(Debug, Default)]
+pub struct PhysicalMemory {
+    memory_map: HashMap<u64, Box<[u8; PAGE_SIZE_4K as usize]>>,
 }
 
-impl Memory {
-    /// Create a new zero‑initialised memory of `size` bytes.
-    pub fn new(size: usize) -> Self {
-        Self {
-            data: vec![0u8; size],
-        }
-    }
-
-    /// Return the size of this memory in bytes.
-    pub fn len(&self) -> usize {
-        self.data.len()
-    }
-
-    /// Return `true` if the memory contains zero bytes.
-    pub fn is_empty(&self) -> bool {
-        self.data.is_empty()
+impl PhysicalMemory {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Read a little‑endian `u32` from the given address.
@@ -52,15 +39,10 @@ impl Memory {
     /// Returns `MemoryError::OutOfBounds` if `addr` or `addr+3` lies
     /// outside the valid memory range.
     pub fn read_u32(&self, addr: u64) -> Result<u32, MemoryError> {
-        let end = addr.checked_add(3).ok_or(MemoryError::OutOfBounds(addr))?;
-        if end as usize >= self.data.len() {
-            return Err(MemoryError::OutOfBounds(addr));
-        }
-
-        let base = addr as usize;
-        Ok(u32::from_le_bytes(
-            self.data[base..base + 4].try_into().unwrap(),
-        ))
+        // use read_bytes to avoid duplicating the out-of-bounds check
+        let mut data = [0u8; 4];
+        self.read_bytes(addr, &mut data)?;
+        Ok(u32::from_le_bytes(data))
     }
 
     /// Write a `u32` value as four little‑endian bytes at the given address.
@@ -68,36 +50,64 @@ impl Memory {
     /// Returns `MemoryError::OutOfBounds` if `addr` or `addr+3` lies
     /// outside the valid memory range.
     pub fn write_u32(&mut self, addr: u64, val: u32) -> Result<(), MemoryError> {
-        let end = addr.checked_add(3).ok_or(MemoryError::OutOfBounds(addr))?;
-        if end as usize >= self.data.len() {
-            return Err(MemoryError::OutOfBounds(addr));
-        }
-
-        let base = addr as usize;
-        Ok(self.data[base..base + 4].copy_from_slice(&val.to_le_bytes()))
+        self.write_bytes(addr, &val.to_le_bytes())
     }
 
-    /// Write an arbitrary slice of bytes starting at the given address.
-    ///
-    /// Returns `MemoryError::OutOfBounds` if the write would extend past the
-    /// end of memory.
     pub fn write_bytes(&mut self, addr: u64, data: &[u8]) -> Result<(), MemoryError> {
-        let len_u64 = data.len() as u64;
-        let end = addr
-            .checked_add(len_u64)
-            .ok_or(MemoryError::OutOfBounds(addr))?;
-        // `end` is one past the last byte; we need `end - 1` to be a valid index.
         if data.is_empty() {
-            // Nothing to write — succeed regardless of address.
             return Ok(());
         }
-        let last = end - 1;
-        if last as usize >= self.data.len() {
-            return Err(MemoryError::OutOfBounds(addr));
+        let start_ppn = addr / PAGE_SIZE_4K as u64;
+        let end_ppn = (addr + data.len() as u64 - 1) / PAGE_SIZE_4K as u64;
+        let mut data_pos = 0usize;
+        let mut bytes_remaining = data.len();
+        for ppn in start_ppn..=end_ppn {
+            let page_offset = if ppn == start_ppn {
+                (addr & PAGE_SIZE_4K_MASK as u64) as usize
+            } else {
+                0
+            };
+            let bytes_to_copy = (PAGE_SIZE_4K - page_offset).min(bytes_remaining);
+            let page_data = self
+                .memory_map
+                .entry(ppn)
+                .or_insert_with(|| Box::new([0u8; PAGE_SIZE_4K]));
+            page_data[page_offset as usize..page_offset as usize + bytes_to_copy]
+                .copy_from_slice(&data[data_pos..data_pos + bytes_to_copy]);
+            data_pos += bytes_to_copy;
+            bytes_remaining -= bytes_to_copy;
+        }
+        Ok(())
+    }
+
+    pub fn read_bytes(&self, addr: u64, data: &mut [u8]) -> Result<(), MemoryError> {
+        if data.is_empty() {
+            return Ok(());
         }
 
-        let base = addr as usize;
-        self.data[base..base + data.len()].copy_from_slice(data);
+        let start_ppn = addr / PAGE_SIZE_4K as u64;
+        let end_ppn = (addr + data.len() as u64 - 1) / PAGE_SIZE_4K as u64;
+        let mut data_pos = 0usize;
+        let mut bytes_remaining = data.len();
+        for ppn in start_ppn..=end_ppn {
+            let page_offset = if ppn == start_ppn {
+                (addr & PAGE_SIZE_4K_MASK as u64) as usize
+            } else {
+                0
+            };
+            let bytes_to_copy = (PAGE_SIZE_4K - page_offset).min(bytes_remaining);
+            match self.memory_map.get(&ppn) {
+                Some(page_data) => {
+                    data[data_pos..data_pos + bytes_to_copy]
+                        .copy_from_slice(&page_data[page_offset..page_offset + bytes_to_copy]);
+                }
+                None => {
+                    return Err(MemoryError::OutOfBounds(ppn * PAGE_SIZE_4K as u64));
+                }
+            }
+            data_pos += bytes_to_copy;
+            bytes_remaining -= bytes_to_copy;
+        }
         Ok(())
     }
 
@@ -109,15 +119,17 @@ impl Memory {
         if size == 0 {
             return Ok(());
         }
-        let end = addr
-            .checked_add(size as u64)
-            .ok_or(MemoryError::OutOfBounds(addr))?;
-        let last = end - 1;
-        if last as usize >= self.data.len() {
-            return Err(MemoryError::OutOfBounds(addr));
+
+        let zero_page = [0u8; PAGE_SIZE_4K as usize];
+        let mut current_addr = addr;
+        let mut bytes_remaining = size;
+        while bytes_remaining > 0 {
+            let chunk_size = bytes_remaining.min(PAGE_SIZE_4K);
+
+            self.write_bytes(current_addr, &zero_page[..chunk_size])?;
+            current_addr += chunk_size as u64;
+            bytes_remaining -= chunk_size;
         }
-        let base = addr as usize;
-        self.data[base..base + size].fill(0);
         Ok(())
     }
 }
@@ -128,7 +140,7 @@ mod tests {
 
     #[test]
     fn test_read_write_u32() {
-        let mut mem = Memory::new(256);
+        let mut mem = PhysicalMemory::new();
 
         // Write and read back at address 0.
         mem.write_u32(0x00, 0xDEAD_BEEF).unwrap();
@@ -141,8 +153,9 @@ mod tests {
         // Verify little‑endian byte layout.
         assert_eq!(mem.read_u32(0x00).unwrap(), 0xDEAD_BEEF);
         // Bytes at 0..4 should be EF, BE, AD, DE
-        let bytes: Vec<u8> = (0..4).map(|i| mem.data[i]).collect();
-        assert_eq!(bytes, vec![0xEF, 0xBE, 0xAD, 0xDE]);
+        let mut bytes = [0u8; 4];
+        mem.read_bytes(0x00, &mut bytes).unwrap();
+        assert_eq!(bytes, [0xEF, 0xBE, 0xAD, 0xDE]);
 
         // Ensure writes don't clobber neighbouring regions.
         mem.write_u32(0x04, 0xAABB_CCDD).unwrap();
@@ -152,49 +165,69 @@ mod tests {
 
     #[test]
     fn test_write_bytes() {
-        let mut mem = Memory::new(64);
+        let mut mem = PhysicalMemory::new();
 
         let data = b"Hello!";
         mem.write_bytes(0, data).unwrap();
 
         // Read back as bytes.
         let mut buf = [0u8; 6];
-        buf.copy_from_slice(&mem.data[0..6]);
+        mem.read_bytes(0, &mut buf).unwrap();
         assert_eq!(&buf, data);
 
-        // Write at an offset.
+        // Write at an offset and read back.
         mem.write_bytes(10, &[0xAA, 0xBB, 0xCC]).unwrap();
-        assert_eq!(mem.data[10], 0xAA);
-        assert_eq!(mem.data[11], 0xBB);
-        assert_eq!(mem.data[12], 0xCC);
+        let mut verify = [0u8; 3];
+        mem.read_bytes(10, &mut verify).unwrap();
+        assert_eq!(verify, [0xAA, 0xBB, 0xCC]);
+    }
+
+    #[test]
+    fn test_fill_zeros_multi_page() {
+        let mut mem = PhysicalMemory::new();
+
+        // Write non-zero data across three pages then zero it all.
+        let size = PAGE_SIZE_4K * 2 + 512;
+        let addr = 0x1000u64;
+        mem.write_bytes(addr, &vec![0xFFu8; size]).unwrap();
+
+        mem.fill_zeros(addr, size).unwrap();
+
+        // Check first byte, a byte in the middle (page boundary), and last byte.
+        let mut buf = [0xFFu8; 1];
+        mem.read_bytes(addr, &mut buf).unwrap();
+        assert_eq!(buf[0], 0, "first byte should be zero");
+
+        mem.read_bytes(addr + PAGE_SIZE_4K as u64, &mut buf).unwrap();
+        assert_eq!(buf[0], 0, "byte at page boundary should be zero");
+
+        mem.read_bytes(addr + size as u64 - 1, &mut buf).unwrap();
+        assert_eq!(buf[0], 0, "last byte should be zero");
     }
 
     #[test]
     fn test_out_of_bounds_detection() {
-        let mem = Memory::new(16);
+        let mem = PhysicalMemory::new();
 
-        // Read exactly at the boundary — 16 bytes means max index 15.
-        // Read at addr 12 is ok (12,13,14,15).
-        assert!(mem.read_u32(12).is_ok());
-        // Read at addr 13 overflows (13+3=16, out of bounds).
-        assert!(mem.read_u32(13).is_err());
-        // Read far past end.
-        assert!(mem.read_u32(100).is_err());
+        // Read from unallocated page → OutOfBounds.
+        assert!(mem.read_u32(0).is_err());
+        assert!(mem.read_u32(0x400000).is_err());
 
-        let mut mem_mut = Memory::new(16);
+        let mut mem_mut = PhysicalMemory::new();
 
-        // Write exactly at the boundary.
-        assert!(mem_mut.write_u32(12, 0).is_ok());
-        // Write past end.
-        assert!(mem_mut.write_u32(13, 0).is_err());
-        assert!(mem_mut.write_u32(100, 0).is_err());
+        // Writes always succeed — pages are allocated on demand.
+        assert!(mem_mut.write_u32(0, 0xDEAD_BEEF).is_ok());
+        assert!(mem_mut.write_u32(0x400000, 0x1234_5678).is_ok());
+        assert!(mem_mut.write_bytes(0, &[0xAA, 0xBB]).is_ok());
 
-        // write_bytes boundary checks.
-        assert!(mem_mut.write_bytes(15, &[0x01]).is_ok()); // last byte
-        assert!(mem_mut.write_bytes(16, &[0x01]).is_err()); // one past end
-        assert!(mem_mut.write_bytes(0, &[0u8; 17]).is_err()); // too large
+        // Read from an allocated page → Ok.
+        assert!(mem_mut.read_u32(0).is_ok());
+        assert!(mem_mut.read_u32(0x400000).is_ok());
 
-        // Empty slice always succeeds.
-        assert!(mem_mut.write_bytes(200, &[]).is_ok());
+        // Read from a page that was never written → OutOfBounds.
+        assert!(mem_mut.read_u32(0x1000).is_err());
+
+        // Empty slice always succeeds regardless of address.
+        assert!(mem_mut.write_bytes(0xDEAD_BEEF_DEAD_BEEF, &[]).is_ok());
     }
 }
