@@ -6,6 +6,8 @@ use goblin::elf::program_header;
 
 use crate::memory::PhysicalMemory;
 
+use crate::io_device::IoDevice;
+
 /// Errors that can occur during ELF loading.
 #[derive(Debug, PartialEq, Eq)]
 pub enum LoaderError {

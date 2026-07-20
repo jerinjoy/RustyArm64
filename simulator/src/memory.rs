@@ -1,5 +1,7 @@
 use std::{collections::HashMap, fmt};
 
+use crate::io_device::IoDevice;
+
 const PAGE_SIZE_4K_OFFSET: usize = 12;
 const PAGE_SIZE_4K_MASK: usize = (1 << PAGE_SIZE_4K_OFFSET) - 1;
 const PAGE_SIZE_4K: usize = 1 << PAGE_SIZE_4K_OFFSET;
@@ -42,11 +44,46 @@ impl PhysicalMemory {
         Self::default()
     }
 
+    /// Zero `size` bytes starting at `addr`.
+    ///
+    /// Returns `MemoryError::OutOfBounds` if the range extends past the end
+    /// of memory.
+    pub fn fill_zeros(&mut self, addr: u64, size: usize) -> Result<(), MemoryError> {
+        if size == 0 {
+            return Ok(());
+        }
+
+        let zero_page = [0u8; PAGE_SIZE_4K as usize];
+        let mut current_addr = addr;
+        let mut bytes_remaining = size;
+        while bytes_remaining > 0 {
+            let chunk_size = bytes_remaining.min(PAGE_SIZE_4K);
+
+            self.write_bytes(current_addr, &zero_page[..chunk_size])?;
+            current_addr += chunk_size as u64;
+            bytes_remaining -= chunk_size;
+        }
+        Ok(())
+    }
+}
+
+impl IoDevice for PhysicalMemory {
+    fn read_u8(&mut self, addr: u64) -> Result<u8, MemoryError> {
+        let mut data = [0u8; 1];
+        self.read_bytes(addr, &mut data)?;
+        Ok(u8::from_le_bytes(data))
+    }
+
+    fn write_u8(&mut self, addr: u64, value: u8) -> Result<(), MemoryError> {
+        self.write_bytes(addr, &[value])?;
+        Ok(())
+    }
+
     /// Read a little‑endian `u32` from the given address.
     ///
     /// Returns `MemoryError::OutOfBounds` if `addr` or `addr+3` lies
     /// outside the valid memory range.
-    pub fn read_u32(&self, addr: u64) -> Result<u32, MemoryError> {
+    fn read_u32(&mut self, addr: u64) -> Result<u32, MemoryError> {
         // use read_bytes to avoid duplicating the out-of-bounds check
         let mut data = [0u8; 4];
         self.read_bytes(addr, &mut data)?;
@@ -57,11 +94,11 @@ impl PhysicalMemory {
     ///
     /// Returns `MemoryError::OutOfBounds` if `addr` or `addr+3` lies
     /// outside the valid memory range.
-    pub fn write_u32(&mut self, addr: u64, val: u32) -> Result<(), MemoryError> {
+    fn write_u32(&mut self, addr: u64, val: u32) -> Result<(), MemoryError> {
         self.write_bytes(addr, &val.to_le_bytes())
     }
 
-    pub fn write_bytes(&mut self, addr: u64, data: &[u8]) -> Result<(), MemoryError> {
+    fn write_bytes(&mut self, addr: u64, data: &[u8]) -> Result<(), MemoryError> {
         if data.is_empty() {
             return Ok(());
         }
@@ -88,7 +125,7 @@ impl PhysicalMemory {
         Ok(())
     }
 
-    pub fn read_bytes(&self, addr: u64, data: &mut [u8]) -> Result<(), MemoryError> {
+    fn read_bytes(&mut self, addr: u64, data: &mut [u8]) -> Result<(), MemoryError> {
         if data.is_empty() {
             return Ok(());
         }
@@ -115,28 +152,6 @@ impl PhysicalMemory {
             }
             data_pos += bytes_to_copy;
             bytes_remaining -= bytes_to_copy;
-        }
-        Ok(())
-    }
-
-    /// Zero `size` bytes starting at `addr`.
-    ///
-    /// Returns `MemoryError::OutOfBounds` if the range extends past the end
-    /// of memory.
-    pub fn fill_zeros(&mut self, addr: u64, size: usize) -> Result<(), MemoryError> {
-        if size == 0 {
-            return Ok(());
-        }
-
-        let zero_page = [0u8; PAGE_SIZE_4K as usize];
-        let mut current_addr = addr;
-        let mut bytes_remaining = size;
-        while bytes_remaining > 0 {
-            let chunk_size = bytes_remaining.min(PAGE_SIZE_4K);
-
-            self.write_bytes(current_addr, &zero_page[..chunk_size])?;
-            current_addr += chunk_size as u64;
-            bytes_remaining -= chunk_size;
         }
         Ok(())
     }
@@ -216,7 +231,7 @@ mod tests {
 
     #[test]
     fn test_out_of_bounds_detection() {
-        let mem = PhysicalMemory::new();
+        let mut mem = PhysicalMemory::new();
 
         // Read from unallocated page → OutOfBounds.
         assert!(mem.read_u32(0).is_err());

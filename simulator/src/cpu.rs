@@ -3,6 +3,8 @@ use crate::executor::{ExecError, execute_instruction};
 use crate::memory::PhysicalMemory;
 use crate::registers::Registers;
 
+use crate::io_device::IoDevice;
+
 /// Errors that can occur during CPU execution.
 #[derive(Debug, PartialEq, Eq)]
 pub enum CpuError {
@@ -134,7 +136,7 @@ impl Cpu {
     ///
     /// Reads 4 bytes in little-endian order. Does not advance PC.
     /// Returns `Err(CpuError::MemoryFault)` if the read goes out of bounds.
-    pub fn fetch(&self) -> Result<u32, CpuError> {
+    pub fn fetch(&mut self) -> Result<u32, CpuError> {
         let pc = self.read_pc();
         self.mem.read_u32(pc).map_err(|_| CpuError::MemoryFault(pc))
     }
