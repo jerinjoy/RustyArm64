@@ -11,6 +11,10 @@ pub enum MemoryError {
     OutOfBounds(u64),
     /// Access was misaligned.
     Misaligned(u64),
+    // No device registered at the given address.
+    UnmappedAddress(u64),
+    // Device exists but rejects the access.
+    UnimplementedRegister(u64),
 }
 
 impl fmt::Display for MemoryError {
@@ -18,6 +22,10 @@ impl fmt::Display for MemoryError {
         match self {
             Self::OutOfBounds(addr) => write!(f, "memory access out of bounds at 0x{addr:016x}"),
             Self::Misaligned(addr) => write!(f, "misaligned memory access at 0x{addr:016x}"),
+            Self::UnmappedAddress(addr) => write!(f, "unmapped address 0x{addr:016x}"),
+            Self::UnimplementedRegister(addr) => {
+                write!(f, "unimplemented register at 0x{addr:016x}")
+            }
         }
     }
 }
@@ -198,7 +206,8 @@ mod tests {
         mem.read_bytes(addr, &mut buf).unwrap();
         assert_eq!(buf[0], 0, "first byte should be zero");
 
-        mem.read_bytes(addr + PAGE_SIZE_4K as u64, &mut buf).unwrap();
+        mem.read_bytes(addr + PAGE_SIZE_4K as u64, &mut buf)
+            .unwrap();
         assert_eq!(buf[0], 0, "byte at page boundary should be zero");
 
         mem.read_bytes(addr + size as u64 - 1, &mut buf).unwrap();
